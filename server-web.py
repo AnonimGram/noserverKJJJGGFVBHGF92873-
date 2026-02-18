@@ -9,6 +9,7 @@ import uuid
 from datetime import datetime
 from typing import Optional, Dict, Any, Set
 import sys
+import traceback
 
 # --- НАСТРОЙКИ ---
 HOST = '0.0.0.0'
@@ -17,7 +18,7 @@ DATABASE = 'anonimgram_server.db'
 
 # --- ЛОГИРОВАНИЕ ---
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.DEBUG,  # Включаем DEBUG для диагностики
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     stream=sys.stdout
 )
@@ -35,89 +36,113 @@ def hash_password(password: str) -> str:
 
 # --- РАБОТА С БАЗОЙ ДАННЫХ ---
 async def init_database():
-    async with aiosqlite.connect(DATABASE) as db:
-        await db.execute('''
-        CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            login TEXT UNIQUE NOT NULL,
-            password_hash TEXT NOT NULL,
-            nickname TEXT DEFAULT '',
-            username TEXT DEFAULT '',
-            avatar_path TEXT DEFAULT '',
-            hide_last_seen BOOLEAN DEFAULT 0,
-            hide_online BOOLEAN DEFAULT 0,
-            last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            is_online BOOLEAN DEFAULT 0
-        )''')
+    """Инициализация базы данных"""
+    try:
+        async with aiosqlite.connect(DATABASE) as db:
+            # Таблица пользователей
+            await db.execute('''
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                login TEXT UNIQUE NOT NULL,
+                password_hash TEXT NOT NULL,
+                nickname TEXT DEFAULT '',
+                username TEXT DEFAULT '',
+                avatar_path TEXT DEFAULT '',
+                hide_last_seen BOOLEAN DEFAULT 0,
+                hide_online BOOLEAN DEFAULT 0,
+                last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                is_online BOOLEAN DEFAULT 0
+            )''')
 
-        cursor = await db.execute("PRAGMA table_info(users)")
-        columns = [column[1] for column in await cursor.fetchall()]
-        if 'is_online' not in columns:
-            logger.info("Добавляем столбец is_online в таблицу users...")
-            await db.execute('ALTER TABLE users ADD COLUMN is_online BOOLEAN DEFAULT 0')
+            # Проверяем наличие колонки is_online
+            cursor = await db.execute("PRAGMA table_info(users)")
+            columns = [column[1] for column in await cursor.fetchall()]
+            if 'is_online' not in columns:
+                logger.info("Добавляем столбец is_online в таблицу users...")
+                await db.execute('ALTER TABLE users ADD COLUMN is_online BOOLEAN DEFAULT 0')
 
-        await db.execute('''
-        CREATE TABLE IF NOT EXISTS chats (
-            id TEXT PRIMARY KEY,
-            name TEXT NOT NULL,
-            type TEXT CHECK(type IN ('user', 'group', 'channel')) NOT NULL,
-            owner_id INTEGER,
-            FOREIGN KEY (owner_id) REFERENCES users (id)
-        )''')
+            # Таблица чатов
+            await db.execute('''
+            CREATE TABLE IF NOT EXISTS chats (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                type TEXT CHECK(type IN ('user', 'group', 'channel')) NOT NULL,
+                owner_id INTEGER,
+                FOREIGN KEY (owner_id) REFERENCES users (id)
+            )''')
 
-        await db.execute('''
-        CREATE TABLE IF NOT EXISTS chat_members (
-            chat_id TEXT,
-            user_id INTEGER,
-            role TEXT CHECK(role IN ('member', 'admin', 'owner')),
-            PRIMARY KEY (chat_id, user_id),
-            FOREIGN KEY (chat_id) REFERENCES chats (id),
-            FOREIGN KEY (user_id) REFERENCES users (id)
-        )''')
-        
-        await db.commit()
-    logger.info("База данных инициализирована")
+            # Таблица участников чатов
+            await db.execute('''
+            CREATE TABLE IF NOT EXISTS chat_members (
+                chat_id TEXT,
+                user_id INTEGER,
+                role TEXT CHECK(role IN ('member', 'admin', 'owner')),
+                PRIMARY KEY (chat_id, user_id),
+                FOREIGN KEY (chat_id) REFERENCES chats (id),
+                FOREIGN KEY (user_id) REFERENCES users (id)
+            )''')
+            
+            await db.commit()
+        logger.info("База данных инициализирована успешно")
+    except Exception as e:
+        logger.error(f"Ошибка инициализации БД: {e}")
+        logger.error(traceback.format_exc())
+        raise
 
 async def get_user_by_login(login: str) -> Optional[Dict[str, Any]]:
-    async with aiosqlite.connect(DATABASE) as db:
-        db.row_factory = aiosqlite.Row
-        cursor = await db.execute(
-            "SELECT id, login, password_hash, nickname, username, avatar_path, hide_last_seen, hide_online, last_seen, is_online FROM users WHERE login = ?",
-            (login,)
-        )
-        user = await cursor.fetchone()
-        return dict(user) if user else None
+    try:
+        async with aiosqlite.connect(DATABASE) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                "SELECT id, login, password_hash, nickname, username, avatar_path, hide_last_seen, hide_online, last_seen, is_online FROM users WHERE login = ?",
+                (login,)
+            )
+            user = await cursor.fetchone()
+            return dict(user) if user else None
+    except Exception as e:
+        logger.error(f"Ошибка get_user_by_login: {e}")
+        return None
 
 async def get_user_by_id(user_id: int) -> Optional[Dict[str, Any]]:
-    async with aiosqlite.connect(DATABASE) as db:
-        db.row_factory = aiosqlite.Row
-        cursor = await db.execute(
-            "SELECT id, login, nickname, username, avatar_path, hide_last_seen, hide_online, last_seen, is_online FROM users WHERE id = ?",
-            (user_id,)
-        )
-        user = await cursor.fetchone()
-        return dict(user) if user else None
+    try:
+        async with aiosqlite.connect(DATABASE) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                "SELECT id, login, nickname, username, avatar_path, hide_last_seen, hide_online, last_seen, is_online FROM users WHERE id = ?",
+                (user_id,)
+            )
+            user = await cursor.fetchone()
+            return dict(user) if user else None
+    except Exception as e:
+        logger.error(f"Ошибка get_user_by_id: {e}")
+        return None
 
 async def update_user_online_status(user_id: int, is_online: bool):
-    async with aiosqlite.connect(DATABASE) as db:
-        await db.execute(
-            "UPDATE users SET is_online = ?, last_seen = CURRENT_TIMESTAMP WHERE id = ?",
-            (1 if is_online else 0, user_id)
-        )
-        await db.commit()
-    
-    if is_online:
-        online_users.add(user_id)
-    elif user_id in online_users:
-        online_users.remove(user_id)
+    try:
+        async with aiosqlite.connect(DATABASE) as db:
+            await db.execute(
+                "UPDATE users SET is_online = ?, last_seen = CURRENT_TIMESTAMP WHERE id = ?",
+                (1 if is_online else 0, user_id)
+            )
+            await db.commit()
+        
+        if is_online:
+            online_users.add(user_id)
+        elif user_id in online_users:
+            online_users.remove(user_id)
+    except Exception as e:
+        logger.error(f"Ошибка update_user_online_status: {e}")
 
 # --- ОБРАБОТЧИКИ ---
-async def health_check(request_headers):
+async def health_check(path, request_headers):
     """Обработчик health check запросов"""
-    return (200, [], b"OK")
+    logger.debug(f"Health check request: {path}")
+    if path == "/" or path == "/health":
+        return (200, [], b"OK")
+    return None
 
 async def ws_handler(websocket):
-    """Обработчик WebSocket соединений на пути /ws"""
+    """Обработчик WebSocket соединений"""
     session_id = str(uuid.uuid4())[:8]
     logger.info(f"Новое WebSocket-подключение (сессия: {session_id})")
     user_id = None
@@ -125,10 +150,12 @@ async def ws_handler(websocket):
     try:
         async for message in websocket:
             try:
+                logger.debug(f"Получено сообщение от {session_id}: {message[:100]}")
                 data = json.loads(message)
                 command = data.get("cmd")
-                logger.debug(f"Получена команда от сессии {session_id}: {command}")
+                logger.info(f"Команда от {session_id}: {command}")
 
+                # Проверка авторизации
                 requires_auth = command in [
                     "GET_CHATS", "GET_MESSAGES", "SEND_MESSAGE", "UPDATE_PROFILE",
                     "GET_USER_INFO", "CREATE_CHAT", "GET_USER_DETAILED_INFO", "PING"
@@ -138,6 +165,7 @@ async def ws_handler(websocket):
                     await websocket.send(json.dumps({"error": "Пользователь не авторизован"}))
                     continue
 
+                # РЕГИСТРАЦИЯ
                 if command == "REGISTER":
                     login = data.get("login")
                     if not login:
@@ -163,6 +191,7 @@ async def ws_handler(websocket):
                     clients[user_id] = websocket
                     await update_user_online_status(user_id, True)
 
+                    # Создаём чат AnonimGram
                     anonimgram_chat_id = f"anonimgram_{new_user_id}"
                     async with aiosqlite.connect(DATABASE) as db:
                         await db.execute("INSERT OR IGNORE INTO chats (id, name, type) VALUES (?, ?, ?)",
@@ -175,6 +204,7 @@ async def ws_handler(websocket):
                     await websocket.send(json.dumps({"status": "REGISTERED", "user_id": new_user_id}))
                     logger.info(f"Пользователь зарегистрирован: ID {new_user_id}")
 
+                # ВХОД
                 elif command == "LOGIN":
                     login = data.get("login")
                     user_info = await get_user_by_login(login)
@@ -183,10 +213,19 @@ async def ws_handler(websocket):
                         continue
 
                     user_id = user_info["id"]
+                    
+                    # Если пользователь уже где-то онлайн, отключаем старое соединение
+                    if user_id in clients:
+                        try:
+                            await clients[user_id].close()
+                        except:
+                            pass
+                    
                     user_sessions[websocket] = user_id
                     clients[user_id] = websocket
                     await update_user_online_status(user_id, True)
 
+                    # Проверяем наличие чата AnonimGram
                     anonimgram_chat_id = f"anonimgram_{user_id}"
                     async with aiosqlite.connect(DATABASE) as db:
                         cursor = await db.execute("SELECT 1 FROM chats WHERE id = ?", (anonimgram_chat_id,))
@@ -199,8 +238,9 @@ async def ws_handler(websocket):
                             active_chats[anonimgram_chat_id] = {"members": [user_id], "type": "user"}
 
                     await websocket.send(json.dumps({"status": "LOGGED_IN", "user_id": user_id}))
-                    logger.info(f"Пользователь вошёл: ID {user_id}")
+                    logger.info(f"Пользователь вошёл: ID {user_id} (логин: {login})")
 
+                # ПОЛУЧЕНИЕ СПИСКА ЧАТОВ
                 elif command == "GET_CHATS":
                     async with aiosqlite.connect(DATABASE) as db:
                         db.row_factory = aiosqlite.Row
@@ -246,6 +286,7 @@ async def ws_handler(websocket):
 
                     await websocket.send(json.dumps({"cmd": "CHATS_LIST", "chats": user_chats}))
 
+                # ПОЛУЧЕНИЕ СООБЩЕНИЙ
                 elif command == "GET_MESSAGES":
                     target_chat_id = data.get("chat_id")
                     messages = []
@@ -257,6 +298,7 @@ async def ws_handler(websocket):
                         })
                     await websocket.send(json.dumps({"cmd": "MESSAGES", "messages": messages}))
 
+                # ОТПРАВКА СООБЩЕНИЯ
                 elif command == "SEND_MESSAGE":
                     target_chat_id = data.get("chat_id")
                     message_text = data.get("text")
@@ -264,6 +306,7 @@ async def ws_handler(websocket):
                         await websocket.send(json.dumps({"error": "Неверный формат"}))
                         continue
 
+                    # Проверяем доступ к чату
                     async with aiosqlite.connect(DATABASE) as db:
                         cursor = await db.execute("SELECT user_id FROM chat_members WHERE chat_id = ?", (target_chat_id,))
                         rows = await cursor.fetchall()
@@ -274,8 +317,17 @@ async def ws_handler(websocket):
                         continue
 
                     sent_time = datetime.now().strftime('%H:%M')
-                    await websocket.send(json.dumps({"status": "MESSAGE_SENT", "time": sent_time}))
+                    
+                    # Отправляем подтверждение отправителю
+                    await websocket.send(json.dumps({
+                        "cmd": "NEW_MESSAGE",
+                        "chat_id": target_chat_id,
+                        "sender_id": user_id,
+                        "text": message_text,
+                        "time": sent_time
+                    }))
 
+                    # Рассылаем сообщение другим участникам
                     for recipient_id in member_ids:
                         if recipient_id != user_id and recipient_id in clients:
                             try:
@@ -289,55 +341,74 @@ async def ws_handler(websocket):
                             except Exception as e:
                                 logger.warning(f"Не удалось отправить сообщение пользователю {recipient_id}: {e}")
 
+                # PING
                 elif command == "PING":
                     if user_id:
                         await update_user_online_status(user_id, True)
-                        await websocket.send(json.dumps({"status": "PONG"}))
+                        await websocket.send(json.dumps({"status": "PONG", "time": datetime.now().strftime('%H:%M:%S')}))
 
-            except json.JSONDecodeError:
-                logger.error(f"Невалидный JSON от сессии {session_id}")
+                # НЕИЗВЕСТНАЯ КОМАНДА
+                else:
+                    logger.warning(f"Неизвестная команда: {command}")
+                    await websocket.send(json.dumps({"error": f"Неизвестная команда: {command}"}))
+
+            except json.JSONDecodeError as e:
+                logger.error(f"Невалидный JSON от сессии {session_id}: {e}")
                 await websocket.send(json.dumps({"error": "Невалидный JSON"}))
             except Exception as e:
-                logger.error(f"Ошибка обработки: {e}")
-                await websocket.send(json.dumps({"error": "Ошибка обработки"}))
+                logger.error(f"Ошибка обработки команды: {e}")
+                logger.error(traceback.format_exc())
+                await websocket.send(json.dumps({"error": f"Внутренняя ошибка сервера: {str(e)}"}))
 
-    except websockets.exceptions.ConnectionClosed:
-        logger.info(f"Соединение закрыто (сессия: {session_id})")
+    except websockets.exceptions.ConnectionClosed as e:
+        logger.info(f"Соединение закрыто клиентом (сессия: {session_id}): {e}")
     except Exception as e:
-        logger.error(f"Неожиданная ошибка: {e}")
+        logger.error(f"Неожиданная ошибка в ws_handler: {e}")
+        logger.error(traceback.format_exc())
     finally:
         if websocket in user_sessions:
             uid = user_sessions.pop(websocket)
             await update_user_online_status(uid, False)
-            clients.pop(uid, None)
-            logger.info(f"Пользователь ID {uid} отключился")
+            if uid in clients:
+                clients.pop(uid, None)
+            logger.info(f"Пользователь ID {uid} отключился (сессия: {session_id})")
 
 # --- ОСНОВНАЯ ФУНКЦИЯ ---
 async def main():
-    await init_database()
-    
-    # Создаем сервер с разными обработчиками для разных путей
-    async with websockets.serve(
-        ws_handler,
-        HOST, 
-        PORT,
-        process_request=health_check,
-        subprotocols=["anonimgram"],
-        ping_interval=20,
-        ping_timeout=60
-    ):
-        logger.info(f"WebSocket-сервер запущен на ws://{HOST}:{PORT}")
-        logger.info("Health check endpoint на / (HTTP 200 OK)")
-        logger.info("WebSocket endpoint на ws://.../ (все пути)")
-        logger.info(f"Python версия: {sys.version}")
+    """Запуск сервера"""
+    try:
+        await init_database()
         
+        # Создаем сервер
+        server = await websockets.serve(
+            ws_handler,
+            HOST, 
+            PORT,
+            ping_interval=20,
+            ping_timeout=60,
+            max_size=10_485_760  # 10MB max message size
+        )
+        
+        logger.info(f"✅ WebSocket-сервер запущен на ws://{HOST}:{PORT}")
+        logger.info(f"🌐 Health check: http://{HOST}:{PORT}/")
+        logger.info(f"🔌 WebSocket endpoint: ws://{HOST}:{PORT}/")
+        logger.info(f"🐍 Python версия: {sys.version}")
+        logger.info("⏳ Сервер готов к работе...")
+        
+        # Держим сервер запущенным
         await asyncio.Future()
+        
+    except Exception as e:
+        logger.error(f"❌ Критическая ошибка при запуске сервера: {e}")
+        logger.error(traceback.format_exc())
+        raise
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        logger.info("Сервер остановлен")
+        logger.info("👋 Сервер остановлен пользователем")
     except Exception as e:
-        logger.error(f"Критическая ошибка: {e}")
-        raise
+        logger.error(f"💥 Фатальная ошибка: {e}")
+        logger.error(traceback.format_exc())
+        sys.exit(1)
