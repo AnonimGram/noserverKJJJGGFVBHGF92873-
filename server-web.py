@@ -1,20 +1,34 @@
 import asyncio
 import websockets
 import json
+import sqlite3
 import hashlib
 import logging
 import uuid
-import sqlite3
+import random
+import string
 from datetime import datetime, timedelta
-from typing import Optional, Dict, Any, Set
+from typing import Optional, Dict, Any, Set, List
 import sys
 import traceback
-from pathlib import Path
+import time
+from collections import defaultdict
 
 # --- НАСТРОЙКИ ---
 HOST = '0.0.0.0'
 PORT = 8080
 DATABASE = 'anonimgram.db'
+
+# --- ЗАЩИТА ОТ DDOS ---
+RATE_LIMIT = {
+    'window': 60,  # окно в секундах
+    'max_requests': 100,  # максимум запросов за окно
+    'ban_time': 300  # время бана в секундах (5 минут)
+}
+
+# Хранилище для rate limiting
+request_counts = defaultdict(list)  # ip -> list of timestamps
+banned_ips = {}  # ip -> unban_time
 
 # --- ЛОГИРОВАНИЕ ---
 logging.basicConfig(
@@ -30,6 +44,45 @@ online_users: Set[int] = set()  # множество онлайн пользов
 typing_status: Dict[str, Set[int]] = {}  # chat_id -> кто печатает
 hidden_online_users: Set[int] = set()  # пользователи, скрывшие онлайн-статус
 hidden_last_seen_users: Set[int] = set()  # пользователи, скрывшие последний визит
+
+# --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ДЛЯ ЗАЩИТЫ ---
+def is_banned(ip: str) -> bool:
+    """Проверка, забанен ли IP"""
+    if ip in banned_ips:
+        if time.time() < banned_ips[ip]:
+            return True
+        else:
+            del banned_ips[ip]
+    return False
+
+def check_rate_limit(ip: str) -> bool:
+    """Проверка rate limiting"""
+    now = time.time()
+    
+    # Очищаем старые записи
+    request_counts[ip] = [t for t in request_counts[ip] if now - t < RATE_LIMIT['window']]
+    
+    # Проверяем лимит
+    if len(request_counts[ip]) >= RATE_LIMIT['max_requests']:
+        banned_ips[ip] = now + RATE_LIMIT['ban_time']
+        logger.warning(f"🚫 IP {ip} забанен на {RATE_LIMIT['ban_time']}с из-за превышения лимита")
+        return False
+    
+    # Добавляем новый запрос
+    request_counts[ip].append(now)
+    return True
+
+def generate_channel_id() -> str:
+    """Генерирует уникальный ID для канала (18 цифр)"""
+    return 'channel_' + ''.join(random.choices(string.digits, k=18))
+
+def generate_group_id() -> str:
+    """Генерирует уникальный ID для группы (10 цифр)"""
+    return 'group_' + ''.join(random.choices(string.digits, k=10))
+
+def generate_private_chat_id(user1: int, user2: int) -> str:
+    """Генерирует ID для приватного чата"""
+    return f"private_{min(user1, user2)}_{max(user1, user2)}"
 
 # --- РАБОТА С БАЗОЙ ДАННЫХ ---
 def init_database():
@@ -52,14 +105,19 @@ def init_database():
         deleted_at TIMESTAMP NULL
     )''')
     
-    # Таблица чатов
+    # Таблица чатов (общая)
     cursor.execute('''
     CREATE TABLE IF NOT EXISTS chats (
         id TEXT PRIMARY KEY,
         name TEXT NOT NULL,
-        type TEXT CHECK(type IN ('private', 'group', 'system')) NOT NULL,
+        type TEXT CHECK(type IN ('private', 'group', 'channel', 'system')) NOT NULL,
+        description TEXT DEFAULT '',
+        avatar_path TEXT DEFAULT '',
+        owner_id INTEGER,
+        is_public BOOLEAN DEFAULT 0,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        deleted_at TIMESTAMP NULL
+        deleted_at TIMESTAMP NULL,
+        FOREIGN KEY (owner_id) REFERENCES users (id) ON DELETE SET NULL
     )''')
     
     # Таблица участников чатов
@@ -67,9 +125,38 @@ def init_database():
     CREATE TABLE IF NOT EXISTS chat_members (
         chat_id TEXT,
         user_id INTEGER,
+        role TEXT CHECK(role IN ('member', 'admin', 'owner', 'subscriber')) DEFAULT 'member',
         joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         left_at TIMESTAMP NULL,
-        PRIMARY KEY (chat_id, user_id)
+        PRIMARY KEY (chat_id, user_id),
+        FOREIGN KEY (chat_id) REFERENCES chats (id) ON DELETE CASCADE,
+        FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
+    )''')
+    
+    # Таблица для хранения информации о каналах (подписчики)
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS channel_subscribers (
+        channel_id TEXT,
+        user_id INTEGER,
+        subscribed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        unsubscribed_at TIMESTAMP NULL,
+        PRIMARY KEY (channel_id, user_id),
+        FOREIGN KEY (channel_id) REFERENCES chats (id) ON DELETE CASCADE,
+        FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
+    )''')
+    
+    # Таблица для приглашений в группы
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS group_invites (
+        group_id TEXT,
+        invite_code TEXT UNIQUE,
+        created_by INTEGER,
+        expires_at TIMESTAMP,
+        uses_left INTEGER DEFAULT 1,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (group_id, invite_code),
+        FOREIGN KEY (group_id) REFERENCES chats (id) ON DELETE CASCADE,
+        FOREIGN KEY (created_by) REFERENCES users (id) ON DELETE SET NULL
     )''')
     
     conn.commit()
@@ -201,7 +288,7 @@ def delete_user_account(user_id: int) -> bool:
             (user_id,)
         )
         
-        # Помечаем чаты как удаленные (опционально)
+        # Помечаем чаты как удаленные
         cursor.execute(
             "UPDATE chat_members SET left_at = CURRENT_TIMESTAMP WHERE user_id = ?",
             (user_id,)
@@ -226,59 +313,65 @@ def delete_user_account(user_id: int) -> bool:
         logger.error(f"❌ Ошибка удаления аккаунта: {e}")
         return False
 
-def get_or_create_chat(chat_id: str, name: str, chat_type: str) -> bool:
-    """Получение или создание чата"""
+def create_chat(chat_id: str, name: str, chat_type: str, owner_id: int, description: str = "", is_public: bool = False) -> bool:
+    """Создание чата (группы или канала)"""
     conn = sqlite3.connect(DATABASE)
     cursor = conn.cursor()
     try:
         cursor.execute(
-            "INSERT OR IGNORE INTO chats (id, name, type) VALUES (?, ?, ?)",
-            (chat_id, name, chat_type)
+            """INSERT INTO chats (id, name, type, owner_id, description, is_public, avatar_path) 
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (chat_id, name, chat_type, owner_id, description, 1 if is_public else 0, f"GENERATE:{name}:#{random_color()}")
         )
         conn.commit()
         return True
-    except:
+    except Exception as e:
+        logger.error(f"❌ Ошибка создания чата: {e}")
         return False
     finally:
         conn.close()
 
-def add_chat_member(chat_id: str, user_id: int):
+def add_chat_member(chat_id: str, user_id: int, role: str = 'member'):
     """Добавление участника в чат"""
     conn = sqlite3.connect(DATABASE)
     cursor = conn.cursor()
     cursor.execute(
-        "INSERT OR IGNORE INTO chat_members (chat_id, user_id) VALUES (?, ?)",
-        (chat_id, user_id)
+        "INSERT OR IGNORE INTO chat_members (chat_id, user_id, role) VALUES (?, ?, ?)",
+        (chat_id, user_id, role)
     )
     conn.commit()
     conn.close()
 
-def remove_chat_member(chat_id: str, user_id: int):
-    """Удаление участника из чата (при удалении аккаунта)"""
+def add_channel_subscriber(channel_id: str, user_id: int):
+    """Добавление подписчика в канал"""
     conn = sqlite3.connect(DATABASE)
     cursor = conn.cursor()
     cursor.execute(
-        "UPDATE chat_members SET left_at = CURRENT_TIMESTAMP WHERE chat_id = ? AND user_id = ?",
-        (chat_id, user_id)
+        "INSERT OR IGNORE INTO channel_subscribers (channel_id, user_id) VALUES (?, ?)",
+        (channel_id, user_id)
+    )
+    # Также добавляем в chat_members для совместимости
+    cursor.execute(
+        "INSERT OR IGNORE INTO chat_members (chat_id, user_id, role) VALUES (?, ?, ?)",
+        (channel_id, user_id, 'subscriber')
     )
     conn.commit()
     conn.close()
 
-def get_user_chats(user_id: int) -> list:
-    """Получение списка чатов пользователя (только активные)"""
+def remove_channel_subscriber(channel_id: str, user_id: int):
+    """Удаление подписчика из канала"""
     conn = sqlite3.connect(DATABASE)
-    conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
-    cursor.execute('''
-        SELECT c.id, c.name, c.type
-        FROM chats c
-        JOIN chat_members cm ON c.id = cm.chat_id
-        WHERE cm.user_id = ? AND cm.left_at IS NULL AND c.deleted_at IS NULL
-        ORDER BY c.created_at DESC
-    ''', (user_id,))
-    chats = cursor.fetchall()
+    cursor.execute(
+        "UPDATE channel_subscribers SET unsubscribed_at = CURRENT_TIMESTAMP WHERE channel_id = ? AND user_id = ?",
+        (channel_id, user_id)
+    )
+    cursor.execute(
+        "UPDATE chat_members SET left_at = CURRENT_TIMESTAMP WHERE chat_id = ? AND user_id = ?",
+        (channel_id, user_id)
+    )
+    conn.commit()
     conn.close()
-    return [dict(chat) for chat in chats]
 
 def is_chat_member(chat_id: str, user_id: int) -> bool:
     """Проверка, является ли пользователь участником чата"""
@@ -292,34 +385,148 @@ def is_chat_member(chat_id: str, user_id: int) -> bool:
     conn.close()
     return result
 
-def cleanup_deleted_accounts(days: int = 30):
-    """Очистка полностью удаленных аккаунтов старше N дней"""
+def get_user_chats(user_id: int) -> list:
+    """Получение списка чатов пользователя (только активные)"""
+    conn = sqlite3.connect(DATABASE)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+    cursor.execute('''
+        SELECT c.id, c.name, c.type, c.description, c.avatar_path, c.is_public,
+               cm.role,
+               (SELECT COUNT(*) FROM chat_members WHERE chat_id = c.id AND left_at IS NULL) as members_count
+        FROM chats c
+        JOIN chat_members cm ON c.id = cm.chat_id
+        WHERE cm.user_id = ? AND cm.left_at IS NULL AND c.deleted_at IS NULL
+        ORDER BY 
+            CASE c.type 
+                WHEN 'system' THEN 1
+                WHEN 'private' THEN 2
+                WHEN 'group' THEN 3
+                WHEN 'channel' THEN 4
+            END,
+            c.created_at DESC
+    ''', (user_id,))
+    chats = cursor.fetchall()
+    conn.close()
+    return [dict(chat) for chat in chats]
+
+def get_chat_members(chat_id: str) -> list:
+    """Получение всех участников чата"""
     conn = sqlite3.connect(DATABASE)
     cursor = conn.cursor()
     cursor.execute(
-        "DELETE FROM users WHERE deleted_at IS NOT NULL AND deleted_at < datetime('now', ?)",
-        (f'-{days} days',)
+        "SELECT user_id FROM chat_members WHERE chat_id = ? AND left_at IS NULL",
+        (chat_id,)
     )
-    deleted = cursor.rowcount
+    members = cursor.fetchall()
+    conn.close()
+    return [member[0] for member in members]
+
+def get_chat_info(chat_id: str, user_id: int) -> Optional[Dict]:
+    """Получение информации о чате"""
+    conn = sqlite3.connect(DATABASE)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+    
+    # Проверяем, является ли пользователь участником
+    cursor.execute(
+        "SELECT role FROM chat_members WHERE chat_id = ? AND user_id = ? AND left_at IS NULL",
+        (chat_id, user_id)
+    )
+    membership = cursor.fetchone()
+    
+    cursor.execute('''
+        SELECT c.*, u.nickname as owner_nickname,
+               (SELECT COUNT(*) FROM chat_members WHERE chat_id = c.id AND left_at IS NULL) as members_count
+        FROM chats c
+        LEFT JOIN users u ON c.owner_id = u.id
+        WHERE c.id = ? AND c.deleted_at IS NULL
+    ''', (chat_id,))
+    chat = cursor.fetchone()
+    
+    if not chat:
+        conn.close()
+        return None
+    
+    result = dict(chat)
+    result['is_member'] = membership is not None
+    result['user_role'] = membership['role'] if membership else None
+    
+    # Для каналов получаем количество подписчиков отдельно
+    if result['type'] == 'channel':
+        cursor.execute(
+            "SELECT COUNT(*) FROM channel_subscribers WHERE channel_id = ? AND unsubscribed_at IS NULL",
+            (chat_id,)
+        )
+        result['subscribers_count'] = cursor.fetchone()[0]
+    
+    conn.close()
+    return result
+
+def generate_invite_code(group_id: str, created_by: int, expires_in_days: int = 7, uses: int = 1) -> str:
+    """Генерация кода приглашения в группу"""
+    conn = sqlite3.connect(DATABASE)
+    cursor = conn.cursor()
+    invite_code = ''.join(random.choices(string.ascii_uppercase + string.digits, k=8))
+    expires_at = (datetime.now() + timedelta(days=expires_in_days)).isoformat()
+    
+    cursor.execute(
+        """INSERT INTO group_invites (group_id, invite_code, created_by, expires_at, uses_left) 
+           VALUES (?, ?, ?, ?, ?)""",
+        (group_id, invite_code, created_by, expires_at, uses)
+    )
     conn.commit()
     conn.close()
-    if deleted > 0:
-        logger.info(f"🧹 Очищено {deleted} старых удаленных аккаунтов")
+    return invite_code
 
-# --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
-def generate_chat_id() -> str:
-    """Генерирует ID для группового чата"""
-    return f"group_{uuid.uuid4().hex[:12]}"
+def use_invite_code(invite_code: str, user_id: int) -> Optional[str]:
+    """Использование кода приглашения"""
+    conn = sqlite3.connect(DATABASE)
+    cursor = conn.cursor()
+    
+    # Проверяем код
+    cursor.execute(
+        "SELECT group_id, expires_at, uses_left FROM group_invites WHERE invite_code = ?",
+        (invite_code,)
+    )
+    invite = cursor.fetchone()
+    
+    if not invite:
+        conn.close()
+        return None
+    
+    group_id, expires_at, uses_left = invite
+    
+    # Проверяем срок действия
+    if datetime.fromisoformat(expires_at) < datetime.now():
+        conn.close()
+        return None
+    
+    # Проверяем количество использований
+    if uses_left <= 0:
+        conn.close()
+        return None
+    
+    # Добавляем пользователя в группу
+    cursor.execute(
+        "INSERT OR IGNORE INTO chat_members (chat_id, user_id, role) VALUES (?, ?, ?)",
+        (group_id, user_id, 'member')
+    )
+    
+    # Уменьшаем количество использований
+    cursor.execute(
+        "UPDATE group_invites SET uses_left = uses_left - 1 WHERE invite_code = ?",
+        (invite_code,)
+    )
+    
+    conn.commit()
+    conn.close()
+    return group_id
 
-def generate_temp_id() -> str:
-    """Генерирует временный ID для сообщения"""
-    return f"msg_{uuid.uuid4().hex[:16]}"
-
-def get_current_time() -> str:
-    return datetime.now().strftime('%H:%M')
-
-def get_current_timestamp() -> str:
-    return datetime.now().isoformat()
+def random_color() -> str:
+    """Генерация случайного цвета для аватарки"""
+    colors = ['2196F3', '4CAF50', 'F44336', '9C27B0', 'FF9800', '795548', '607D8B']
+    return random.choice(colors)
 
 def format_last_seen(timestamp: str, hide_last_seen: bool = False) -> str:
     """Форматирование времени последнего визита с учетом приватности"""
@@ -373,19 +580,63 @@ async def notify_contacts_status_change(user_id: int, is_online: bool):
             except:
                 pass
 
-# --- ОСНОВНОЙ ОБРАБОТЧИК WEBSOCKET ---
+async def handle_http_request(path, request_headers):
+    """Обрабатывает HTTP-запросы для health check"""
+    if path == "/" or path == "/health":
+        headers = [
+            ("Content-Type", "text/plain"),
+            ("Content-Length", "2"),
+            ("Connection", "close")
+        ]
+        return (200, headers, b"OK")
+    return None
+
 async def ws_handler(websocket):
-    """Обработчик WebSocket соединений"""
+    """Основной обработчик WebSocket соединений"""
+    # Получаем IP для rate limiting
+    client_ip = websocket.remote_address[0]
+    
+    # Проверяем бан
+    if is_banned(client_ip):
+        logger.warning(f"🚫 Заблокирован запрос от забаненного IP: {client_ip}")
+        await websocket.close()
+        return
+    
     session_id = str(uuid.uuid4())[:8]
-    logger.info(f"🔌 Новое подключение (сессия: {session_id})")
+    logger.info(f"🔌 Новое подключение (сессия: {session_id}, IP: {client_ip})")
     user_id = None
 
     try:
         async for message in websocket:
+            # Rate limiting
+            if not check_rate_limit(client_ip):
+                logger.warning(f"🚫 IP {client_ip} превысил лимит запросов")
+                await websocket.send(json.dumps({"error": "Слишком много запросов. Попробуйте позже."}))
+                await websocket.close()
+                return
+            
             try:
                 data = json.loads(message)
                 command = data.get("cmd")
                 logger.info(f"📨 Команда: {command} (сессия: {session_id})")
+
+                # Команды, требующие авторизации
+                requires_auth = command in [
+                    "GET_CHATS", "GET_MESSAGES", "SEND_MESSAGE", "UPDATE_PROFILE",
+                    "GET_USER_INFO", "CREATE_CHAT", "GET_USER_DETAILED_INFO", "PING",
+                    "SEARCH_USERS", "GET_CONTACTS", "ADD_CONTACT", "REMOVE_CONTACT",
+                    "BLOCK_USER", "UNBLOCK_USER", "CREATE_GROUP", "CREATE_CHANNEL",
+                    "ADD_CHAT_MEMBER", "REMOVE_CHAT_MEMBER", "LEAVE_CHAT",
+                    "DELETE_MESSAGE", "EDIT_MESSAGE", "FORWARD_MESSAGE",
+                    "MARK_AS_READ", "TYPING", "GET_DRAFT", "SAVE_DRAFT",
+                    "DELETE_DRAFT", "SAVE_MESSAGE", "UNSAVE_MESSAGE",
+                    "GET_SAVED_MESSAGES", "GET_CHAT_INFO", "UPDATE_CHAT_INFO",
+                    "JOIN_CHANNEL", "LEAVE_CHANNEL", "GET_INVITE_LINK", "JOIN_WITH_INVITE"
+                ]
+
+                if requires_auth and user_id is None:
+                    await websocket.send(json.dumps({"error": "Пользователь не авторизован"}))
+                    continue
 
                 # --- РЕГИСТРАЦИЯ ---
                 if command == "REGISTER":
@@ -401,9 +652,10 @@ async def ws_handler(websocket):
 
                     user_id = create_user(login, login)
                     
-                    anonimgram_chat_id = f"anonimgram_{user_id}"
-                    get_or_create_chat(anonimgram_chat_id, "AnonimGram", "system")
-                    add_chat_member(anonimgram_chat_id, user_id)
+                    # Создаем системный чат
+                    anonimgram_chat_id = f"system_{user_id}"
+                    create_chat(anonimgram_chat_id, "AnonimGram", "system", user_id)
+                    add_chat_member(anonimgram_chat_id, user_id, 'member')
 
                     active_connections[user_id] = websocket
                     online_users.add(user_id)
@@ -424,9 +676,9 @@ async def ws_handler(websocket):
                     if not user:
                         # Автоматическая регистрация
                         user_id = create_user(login, login)
-                        anonimgram_chat_id = f"anonimgram_{user_id}"
-                        get_or_create_chat(anonimgram_chat_id, "AnonimGram", "system")
-                        add_chat_member(anonimgram_chat_id, user_id)
+                        anonimgram_chat_id = f"system_{user_id}"
+                        create_chat(anonimgram_chat_id, "AnonimGram", "system", user_id)
+                        add_chat_member(anonimgram_chat_id, user_id, 'member')
                         logger.info(f"✅ Автоматическая регистрация: ID {user_id}")
                     else:
                         user_id = user["id"]
@@ -525,35 +777,43 @@ async def ws_handler(websocket):
 
                     chats = get_user_chats(user_id)
                     
-                    # Добавляем информацию о собеседниках
+                    # Добавляем информацию о собеседниках для приватных чатов
                     for chat in chats:
-                        if chat["type"] == "private" and not chat["id"].startswith("anonimgram_"):
-                            parts = chat["id"].split('_')
-                            if len(parts) == 3:
-                                other_id = int(parts[2]) if int(parts[2]) != user_id else int(parts[1])
-                                other = get_user_by_id(other_id)
-                                if other:
-                                    # Применяем настройки приватности
-                                    is_online = other["is_online"] and other_id not in hidden_online_users
-                                    last_seen = format_last_seen(
-                                        other["last_seen"], 
-                                        other_id in hidden_last_seen_users
-                                    )
-                                    
-                                    chat["other_user"] = {
-                                        "id": other["id"],
-                                        "nickname": other["nickname"],
-                                        "is_online": is_online,
-                                        "last_seen": last_seen
-                                    }
-                                    chat["name"] = other["nickname"]
+                        if chat["type"] == "private":
+                            # Извлекаем ID собеседника из chat_id
+                            if chat["id"].startswith("private_"):
+                                parts = chat["id"].split('_')
+                                if len(parts) == 3:
+                                    other_id = int(parts[2]) if int(parts[2]) != user_id else int(parts[1])
+                                    other = get_user_by_id(other_id)
+                                    if other:
+                                        # Применяем настройки приватности
+                                        is_online = other["is_online"] and other_id not in hidden_online_users
+                                        last_seen = format_last_seen(
+                                            other["last_seen"], 
+                                            other_id in hidden_last_seen_users
+                                        )
+                                        
+                                        chat["other_user"] = {
+                                            "id": other["id"],
+                                            "nickname": other["nickname"],
+                                            "is_online": is_online,
+                                            "last_seen": last_seen
+                                        }
+                                        chat["name"] = other["nickname"]
+                        
+                        elif chat["type"] == "group" or chat["type"] == "channel":
+                            # Добавляем информацию о владельце
+                            owner = get_user_by_id(chat.get("owner_id"))
+                            if owner:
+                                chat["owner_nickname"] = owner["nickname"]
 
                     await websocket.send(json.dumps({
                         "cmd": "CHATS_LIST",
                         "chats": chats
                     }))
 
-                # --- ПОЛУЧЕНИЕ СООБЩЕНИЙ ---
+                # --- ПОЛУЧЕНИЕ СООБЩЕНИЙ (пусто - не храним) ---
                 elif command == "GET_MESSAGES":
                     chat_id = data.get("chat_id")
                     
@@ -565,13 +825,15 @@ async def ws_handler(websocket):
                         await websocket.send(json.dumps({"error": "Нет доступа к чату"}))
                         continue
 
+                    # В анонимном мессенджере сообщения не хранятся
                     messages = []
                     
-                    if chat_id == f"anonimgram_{user_id}":
+                    # Для системного чата добавляем приветствие
+                    if chat_id.startswith("system_"):
                         messages.append({
-                            "id": generate_temp_id(),
+                            "id": f"msg_{uuid.uuid4().hex[:16]}",
                             "text": "🔐 Анонимный чат. Сообщения не сохраняются.",
-                            "time": get_current_time(),
+                            "time": datetime.now().strftime('%H:%M'),
                             "sender_id": 0,
                             "is_system": True
                         })
@@ -582,7 +844,7 @@ async def ws_handler(websocket):
                         "chat_id": chat_id
                     }))
 
-                # --- ОТПРАВКА СООБЩЕНИЯ ---
+                # --- ОТПРАВКА СООБЩЕНИЯ (только пересылка) ---
                 elif command == "SEND_MESSAGE":
                     chat_id = data.get("chat_id")
                     text = data.get("text")
@@ -599,21 +861,36 @@ async def ws_handler(websocket):
                         await websocket.send(json.dumps({"error": "Нет доступа к чату"}))
                         continue
 
-                    # Получаем всех участников чата
+                    # Получаем информацию о чате
                     conn = sqlite3.connect(DATABASE)
                     cursor = conn.cursor()
-                    cursor.execute(
-                        "SELECT user_id FROM chat_members WHERE chat_id = ? AND left_at IS NULL", 
-                        (chat_id,)
-                    )
-                    members = cursor.fetchall()
+                    cursor.execute("SELECT type FROM chats WHERE id = ?", (chat_id,))
+                    chat_type = cursor.fetchone()
                     conn.close()
+                    
+                    chat_type = chat_type[0] if chat_type else None
+                    
+                    # Для каналов только владелец и админы могут писать
+                    if chat_type == 'channel':
+                        cursor = conn.cursor()
+                        cursor.execute(
+                            "SELECT role FROM chat_members WHERE chat_id = ? AND user_id = ?",
+                            (chat_id, user_id)
+                        )
+                        role = cursor.fetchone()
+                        if not role or role[0] not in ('owner', 'admin'):
+                            await websocket.send(json.dumps({"error": "Только владелец и админы могут писать в канал"}))
+                            continue
 
-                    message_id = generate_temp_id()
-                    sent_time = get_current_time()
+                    # Получаем всех участников чата
+                    members = get_chat_members(chat_id)
+
+                    # Создаем временный ID для сообщения
+                    message_id = f"msg_{uuid.uuid4().hex[:16]}"
+                    sent_time = datetime.now().strftime('%H:%M')
 
                     # Отправляем всем участникам
-                    for (member_id,) in members:
+                    for member_id in members:
                         if member_id in active_connections:
                             try:
                                 await active_connections[member_id].send(json.dumps({
@@ -677,8 +954,8 @@ async def ws_handler(websocket):
                             target_id in hidden_last_seen_users
                         )
                         
-                        # Проверяем существующий чат
-                        chat_id = f"private_{min(user_id, target_id)}_{max(user_id, target_id)}"
+                        # Проверяем существующий приватный чат
+                        chat_id = generate_private_chat_id(user_id, target_id)
                         user["existing_chat_id"] = chat_id if is_chat_member(chat_id, user_id) else None
                         
                         await websocket.send(json.dumps({
@@ -707,13 +984,13 @@ async def ws_handler(websocket):
                         await websocket.send(json.dumps({"error": "Пользователь не найден"}))
                         continue
 
-                    chat_id = f"private_{min(user_id, target_user_id)}_{max(user_id, target_user_id)}"
+                    chat_id = generate_private_chat_id(user_id, target_user_id)
                     
                     target_name = target.get("nickname", f"User {target_user_id}")
-                    get_or_create_chat(chat_id, target_name, "private")
+                    create_chat(chat_id, target_name, "private", user_id)
                     
-                    add_chat_member(chat_id, user_id)
-                    add_chat_member(chat_id, target_user_id)
+                    add_chat_member(chat_id, user_id, 'member')
+                    add_chat_member(chat_id, target_user_id, 'member')
 
                     # Уведомляем второго пользователя
                     if target_user_id in active_connections:
@@ -735,7 +1012,7 @@ async def ws_handler(websocket):
                 # --- СОЗДАНИЕ ГРУППЫ ---
                 elif command == "CREATE_GROUP":
                     name = data.get("name")
-                    members = data.get("members", [])
+                    description = data.get("description", "")
                     
                     if not name:
                         await websocket.send(json.dumps({"error": "Название группы не указано"}))
@@ -745,37 +1022,225 @@ async def ws_handler(websocket):
                         await websocket.send(json.dumps({"error": "Не авторизован"}))
                         continue
 
-                    chat_id = generate_chat_id()
-                    get_or_create_chat(chat_id, name, "group")
+                    chat_id = generate_group_id()
+                    create_chat(chat_id, name, "group", user_id, description, is_public=False)
                     
-                    # Добавляем создателя
-                    add_chat_member(chat_id, user_id)
-                    
-                    # Добавляем остальных участников
-                    all_members = {user_id}
-                    for member_id in members:
-                        add_chat_member(chat_id, member_id)
-                        all_members.add(member_id)
+                    # Добавляем создателя как owner
+                    add_chat_member(chat_id, user_id, 'owner')
 
-                    # Уведомляем всех участников
-                    for member_id in all_members:
-                        if member_id in active_connections and member_id != user_id:
-                            try:
-                                await active_connections[member_id].send(json.dumps({
-                                    "cmd": "NEW_CHAT",
-                                    "chat": {
-                                        "id": chat_id,
-                                        "name": name,
-                                        "type": "group"
-                                    }
-                                }))
-                            except:
-                                pass
+                    # Генерируем код приглашения
+                    invite_code = generate_invite_code(chat_id, user_id)
 
                     await websocket.send(json.dumps({
                         "status": "GROUP_CREATED",
+                        "chat_id": chat_id,
+                        "invite_code": invite_code
+                    }))
+
+                # --- СОЗДАНИЕ КАНАЛА ---
+                elif command == "CREATE_CHANNEL":
+                    name = data.get("name")
+                    description = data.get("description", "")
+                    is_public = data.get("is_public", False)
+                    
+                    if not name:
+                        await websocket.send(json.dumps({"error": "Название канала не указано"}))
+                        continue
+
+                    if user_id is None:
+                        await websocket.send(json.dumps({"error": "Не авторизован"}))
+                        continue
+
+                    chat_id = generate_channel_id()
+                    create_chat(chat_id, name, "channel", user_id, description, is_public)
+                    
+                    # Добавляем создателя как owner
+                    add_chat_member(chat_id, user_id, 'owner')
+
+                    await websocket.send(json.dumps({
+                        "status": "CHANNEL_CREATED",
                         "chat_id": chat_id
                     }))
+
+                # --- ПОЛУЧЕНИЕ ИНФОРМАЦИИ О ЧАТЕ ---
+                elif command == "GET_CHAT_INFO":
+                    chat_id = data.get("chat_id")
+                    
+                    if not chat_id:
+                        await websocket.send(json.dumps({"error": "ID чата не указан"}))
+                        continue
+
+                    if user_id is None:
+                        await websocket.send(json.dumps({"error": "Не авторизован"}))
+                        continue
+
+                    chat_info = get_chat_info(chat_id, user_id)
+                    
+                    if chat_info:
+                        await websocket.send(json.dumps({
+                            "cmd": "CHAT_INFO",
+                            "chat_info": chat_info
+                        }))
+                    else:
+                        await websocket.send(json.dumps({"error": "Чат не найден"}))
+
+                # --- ВСТУПЛЕНИЕ В КАНАЛ ---
+                elif command == "JOIN_CHANNEL":
+                    channel_id = data.get("channel_id")
+                    
+                    if not channel_id:
+                        await websocket.send(json.dumps({"error": "ID канала не указан"}))
+                        continue
+
+                    if user_id is None:
+                        await websocket.send(json.dumps({"error": "Не авторизован"}))
+                        continue
+
+                    # Проверяем, существует ли канал
+                    conn = sqlite3.connect(DATABASE)
+                    cursor = conn.cursor()
+                    cursor.execute(
+                        "SELECT type, is_public FROM chats WHERE id = ? AND deleted_at IS NULL",
+                        (channel_id,)
+                    )
+                    chat = cursor.fetchone()
+                    conn.close()
+                    
+                    if not chat or chat[0] != 'channel':
+                        await websocket.send(json.dumps({"error": "Канал не найден"}))
+                        continue
+                    
+                    # Проверяем, не состоит ли уже пользователь
+                    if is_chat_member(channel_id, user_id):
+                        await websocket.send(json.dumps({"error": "Вы уже в канале"}))
+                        continue
+                    
+                    # Добавляем пользователя как подписчика
+                    add_channel_subscriber(channel_id, user_id)
+                    
+                    # Уведомляем владельца (если онлайн)
+                    conn = sqlite3.connect(DATABASE)
+                    cursor = conn.cursor()
+                    cursor.execute("SELECT owner_id FROM chats WHERE id = ?", (channel_id,))
+                    owner_id = cursor.fetchone()
+                    conn.close()
+                    
+                    if owner_id and owner_id[0] in active_connections:
+                        try:
+                            await active_connections[owner_id[0]].send(json.dumps({
+                                "cmd": "CHANNEL_NEW_SUBSCRIBER",
+                                "channel_id": channel_id,
+                                "user_id": user_id
+                            }))
+                        except:
+                            pass
+                    
+                    await websocket.send(json.dumps({
+                        "status": "JOINED_CHANNEL",
+                        "message": "Вы успешно подписались на канал"
+                    }))
+
+                # --- ВЫХОД ИЗ КАНАЛА ---
+                elif command == "LEAVE_CHANNEL":
+                    channel_id = data.get("channel_id")
+                    
+                    if not channel_id:
+                        await websocket.send(json.dumps({"error": "ID канала не указан"}))
+                        continue
+
+                    if user_id is None:
+                        await websocket.send(json.dumps({"error": "Не авторизован"}))
+                        continue
+
+                    # Проверяем, не является ли пользователь владельцем
+                    conn = sqlite3.connect(DATABASE)
+                    cursor = conn.cursor()
+                    cursor.execute(
+                        "SELECT owner_id FROM chats WHERE id = ?",
+                        (channel_id,)
+                    )
+                    owner = cursor.fetchone()
+                    conn.close()
+                    
+                    if owner and owner[0] == user_id:
+                        await websocket.send(json.dumps({"error": "Владелец не может покинуть канал"}))
+                        continue
+                    
+                    remove_channel_subscriber(channel_id, user_id)
+                    
+                    await websocket.send(json.dumps({
+                        "status": "LEFT_CHANNEL",
+                        "message": "Вы отписались от канала"
+                    }))
+
+                # --- ПОЛУЧЕНИЕ КОДА ПРИГЛАШЕНИЯ (для групп) ---
+                elif command == "GET_INVITE_LINK":
+                    chat_id = data.get("chat_id")
+                    
+                    if not chat_id:
+                        await websocket.send(json.dumps({"error": "ID чата не указан"}))
+                        continue
+
+                    if user_id is None:
+                        await websocket.send(json.dumps({"error": "Не авторизован"}))
+                        continue
+
+                    # Проверяем, является ли пользователь владельцем или админом
+                    conn = sqlite3.connect(DATABASE)
+                    cursor = conn.cursor()
+                    cursor.execute(
+                        "SELECT role FROM chat_members WHERE chat_id = ? AND user_id = ?",
+                        (chat_id, user_id)
+                    )
+                    role = cursor.fetchone()
+                    conn.close()
+                    
+                    if not role or role[0] not in ('owner', 'admin'):
+                        await websocket.send(json.dumps({"error": "Недостаточно прав"}))
+                        continue
+                    
+                    invite_code = generate_invite_code(chat_id, user_id)
+                    
+                    await websocket.send(json.dumps({
+                        "cmd": "INVITE_LINK",
+                        "invite_code": invite_code,
+                        "chat_id": chat_id
+                    }))
+
+                # --- ВСТУПЛЕНИЕ ПО ПРИГЛАШЕНИЮ (для групп) ---
+                elif command == "JOIN_WITH_INVITE":
+                    invite_code = data.get("invite_code")
+                    
+                    if not invite_code:
+                        await websocket.send(json.dumps({"error": "Код приглашения не указан"}))
+                        continue
+
+                    if user_id is None:
+                        await websocket.send(json.dumps({"error": "Не авторизован"}))
+                        continue
+
+                    group_id = use_invite_code(invite_code, user_id)
+                    
+                    if group_id:
+                        # Уведомляем участников группы
+                        members = get_chat_members(group_id)
+                        for member_id in members:
+                            if member_id in active_connections:
+                                try:
+                                    await active_connections[member_id].send(json.dumps({
+                                        "cmd": "NEW_CHAT_MEMBER",
+                                        "chat_id": group_id,
+                                        "user_id": user_id
+                                    }))
+                                except:
+                                    pass
+                        
+                        await websocket.send(json.dumps({
+                            "status": "JOINED_GROUP",
+                            "chat_id": group_id
+                        }))
+                    else:
+                        await websocket.send(json.dumps({"error": "Недействительный код приглашения"}))
 
                 # --- СТАТУС НАБОРА ТЕКСТА ---
                 elif command == "TYPING":
@@ -786,16 +1251,9 @@ async def ws_handler(websocket):
                         continue
 
                     # Получаем участников чата
-                    conn = sqlite3.connect(DATABASE)
-                    cursor = conn.cursor()
-                    cursor.execute(
-                        "SELECT user_id FROM chat_members WHERE chat_id = ? AND left_at IS NULL",
-                        (chat_id,)
-                    )
-                    members = cursor.fetchall()
-                    conn.close()
+                    members = get_chat_members(chat_id)
 
-                    for (member_id,) in members:
+                    for member_id in members:
                         if member_id != user_id and member_id in active_connections:
                             try:
                                 await active_connections[member_id].send(json.dumps({
@@ -812,7 +1270,7 @@ async def ws_handler(websocket):
                     if user_id:
                         await websocket.send(json.dumps({
                             "status": "PONG",
-                            "time": get_current_time()
+                            "time": datetime.now().strftime('%H:%M:%S')
                         }))
 
                 else:
@@ -845,32 +1303,10 @@ async def ws_handler(websocket):
             
             logger.info(f"👋 Пользователь {user_id} отключился")
 
-# --- ОБРАБОТКА HTTP (HEALTH CHECK) ---
-async def handle_http_request(path, request_headers):
-    """Обрабатывает HTTP-запросы для health check"""
-    if path == "/" or path == "/health":
-        headers = [
-            ("Content-Type", "text/plain"),
-            ("Content-Length", "2"),
-            ("Connection", "close")
-        ]
-        return (200, headers, b"OK")
-    return None
-
-# --- ПЕРИОДИЧЕСКАЯ ОЧИСТКА ---
-async def periodic_cleanup():
-    """Периодическая очистка старых удаленных аккаунтов"""
-    while True:
-        await asyncio.sleep(86400)  # Раз в день
-        cleanup_deleted_accounts(30)  # Удаляем аккаунты старше 30 дней
-
-# --- ЗАПУСК СЕРВЕРА ---
 async def main():
+    """Основная функция запуска сервера"""
     try:
         init_database()
-        
-        # Запускаем периодическую очистку
-        asyncio.create_task(periodic_cleanup())
         
         async with websockets.serve(
             ws_handler,
@@ -882,6 +1318,8 @@ async def main():
         ) as server:
             logger.info(f"✅ Анонимный сервер AnonimGram запущен на ws://{HOST}:{PORT}")
             logger.info(f"📊 База данных: {DATABASE}")
+            logger.info(f"👥 Поддерживаются: группы и каналы")
+            logger.info(f"🛡️ Защита от DDoS: включена (макс {RATE_LIMIT['max_requests']} запросов за {RATE_LIMIT['window']}с)")
             logger.info(f"👤 Онлайн-статус: можно скрыть")
             logger.info(f"🗑️ Удаление аккаунтов: поддерживается")
             logger.info(f"📢 Сообщения НЕ сохраняются!")
