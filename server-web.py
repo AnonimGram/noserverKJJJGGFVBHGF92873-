@@ -42,8 +42,7 @@ online_users: Set[int] = set()
 typing_status: Dict[str, Set[int]] = {}
 hidden_online_users: Set[int] = set()
 hidden_last_seen_users: Set[int] = set()
-
-# --- PREMIUM ХРАНИЛИЩЕ ---
+friend_requests: Dict[int, List[Dict]] = {}
 premium_users: Dict[int, Dict] = {}
 
 # --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
@@ -76,6 +75,32 @@ def generate_group_id() -> str:
 def generate_private_chat_id(user1: int, user2: int) -> str:
     return f"private_{min(user1, user2)}_{max(user1, user2)}"
 
+def random_color() -> str:
+    colors = ['2196F3', '4CAF50', 'F44336', '9C27B0', 'FF9800', '795548', '607D8B']
+    return random.choice(colors)
+
+def format_last_seen(timestamp: str, hide_last_seen: bool = False) -> str:
+    if hide_last_seen:
+        return "скрыто"
+    if not timestamp:
+        return "никогда"
+    try:
+        last = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
+        now = datetime.now()
+        delta = now - last
+        if delta.days > 7:
+            return last.strftime('%d.%m.%Y')
+        elif delta.days > 0:
+            return f"{delta.days} дн. назад"
+        elif delta.seconds > 3600:
+            return f"{delta.seconds // 3600} ч. назад"
+        elif delta.seconds > 60:
+            return f"{delta.seconds // 60} мин. назад"
+        else:
+            return "только что"
+    except:
+        return "неизвестно"
+
 # --- PREMIUM ФУНКЦИИ ---
 def activate_premium(user_id: int, plan: str) -> bool:
     expiry_date = calculate_expiry_date(plan)
@@ -90,11 +115,9 @@ def activate_premium(user_id: int, plan: str) -> bool:
 def is_premium(user_id: int) -> bool:
     if user_id not in premium_users:
         return False
-    
     info = premium_users[user_id]
     if info['plan'] == 'forever':
         return True
-    
     if info['expiry']:
         expiry = datetime.fromisoformat(info['expiry'])
         if expiry > datetime.now():
@@ -123,6 +146,82 @@ def has_used_free_trial(user_id: int) -> bool:
         return premium_users[user_id]['plan'] == '1day'
     return False
 
+# --- ЗАПРОСЫ НА ДРУЖБУ ---
+def send_friend_request(from_user_id: int, to_user_id: int) -> bool:
+    if to_user_id not in friend_requests:
+        friend_requests[to_user_id] = []
+    for req in friend_requests[to_user_id]:
+        if req['from_id'] == from_user_id:
+            return False
+    from_user = get_user_by_id(from_user_id)
+    if not from_user:
+        return False
+    friend_requests[to_user_id].append({
+        'from_id': from_user_id,
+        'from_login': from_user['login'],
+        'from_nickname': from_user['nickname'],
+        'timestamp': datetime.now().isoformat()
+    })
+    logger.info(f"📨 Запрос на дружбу от {from_user_id} к {to_user_id}")
+    if to_user_id in active_connections:
+        try:
+            asyncio.create_task(active_connections[to_user_id].send(json.dumps({
+                "cmd": "NEW_FRIEND_REQUEST",
+                "from_user_id": from_user_id,
+                "from_login": from_user['login'],
+                "from_nickname": from_user['nickname']
+            })))
+        except:
+            pass
+    return True
+
+def get_friend_requests(user_id: int) -> list:
+    return friend_requests.get(user_id, [])
+
+def accept_friend_request(user_id: int, from_user_id: int) -> bool:
+    requests = friend_requests.get(user_id, [])
+    request = None
+    for req in requests:
+        if req['from_id'] == from_user_id:
+            request = req
+            break
+    if not request:
+        return False
+    friend_requests[user_id] = [r for r in requests if r['from_id'] != from_user_id]
+    chat_id = generate_private_chat_id(user_id, from_user_id)
+    target_name = request['from_nickname'] or request['from_login']
+    create_chat(chat_id, target_name, "private", user_id)
+    add_chat_member(chat_id, user_id, 'member')
+    add_chat_member(chat_id, from_user_id, 'member')
+    logger.info(f"✅ Запрос принят: {from_user_id} и {user_id} теперь друзья, чат {chat_id}")
+    for uid in [user_id, from_user_id]:
+        if uid in active_connections:
+            try:
+                asyncio.create_task(active_connections[uid].send(json.dumps({
+                    "status": "FRIEND_REQUEST_ACCEPTED",
+                    "chat_id": chat_id,
+                    "from_id": from_user_id,
+                    "from_nickname": request['from_nickname'],
+                    "to_id": user_id
+                })))
+            except:
+                pass
+    return True
+
+def reject_friend_request(user_id: int, from_user_id: int) -> bool:
+    requests = friend_requests.get(user_id, [])
+    friend_requests[user_id] = [r for r in requests if r['from_id'] != from_user_id]
+    logger.info(f"❌ Запрос отклонён: от {from_user_id} к {user_id}")
+    if from_user_id in active_connections:
+        try:
+            asyncio.create_task(active_connections[from_user_id].send(json.dumps({
+                "status": "FRIEND_REQUEST_REJECTED",
+                "from_id": user_id
+            })))
+        except:
+            pass
+    return True
+
 async def check_expired_premium():
     while True:
         await asyncio.sleep(3600)
@@ -132,16 +231,27 @@ async def check_expired_premium():
                 expiry = datetime.fromisoformat(info['expiry'])
                 if expiry <= datetime.now():
                     expired.append(user_id)
-        
         for user_id in expired:
             del premium_users[user_id]
             logger.info(f"⌛ Premium истек для пользователя {user_id}")
+
+# ========== АВТОМАТИЧЕСКИЙ ПИНГ ДЛЯ RENDER ==========
+async def auto_ping():
+    """Отправляет пинг на самого себя каждую минуту, чтобы Render не засыпал"""
+    while True:
+        await asyncio.sleep(60)
+        try:
+            import aiohttp
+            async with aiohttp.ClientSession() as session:
+                async with session.get(f'http://{HOST}:{PORT}/') as resp:
+                    logger.info(f"🔄 Auto-ping: статус {resp.status}")
+        except Exception as e:
+            logger.warning(f"⚠️ Auto-ping ошибка: {e}")
 
 # --- РАБОТА С БАЗОЙ ДАННЫХ ---
 def init_database():
     conn = sqlite3.connect(DATABASE)
     cursor = conn.cursor()
-    
     cursor.execute('''
     CREATE TABLE IF NOT EXISTS users (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -154,7 +264,6 @@ def init_database():
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         deleted_at TIMESTAMP NULL
     )''')
-    
     cursor.execute('''
     CREATE TABLE IF NOT EXISTS chats (
         id TEXT PRIMARY KEY,
@@ -168,7 +277,6 @@ def init_database():
         deleted_at TIMESTAMP NULL,
         FOREIGN KEY (owner_id) REFERENCES users (id) ON DELETE SET NULL
     )''')
-    
     cursor.execute('''
     CREATE TABLE IF NOT EXISTS chat_members (
         chat_id TEXT,
@@ -180,7 +288,6 @@ def init_database():
         FOREIGN KEY (chat_id) REFERENCES chats (id) ON DELETE CASCADE,
         FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
     )''')
-    
     cursor.execute('''
     CREATE TABLE IF NOT EXISTS channel_subscribers (
         channel_id TEXT,
@@ -191,7 +298,6 @@ def init_database():
         FOREIGN KEY (channel_id) REFERENCES chats (id) ON DELETE CASCADE,
         FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
     )''')
-    
     cursor.execute('''
     CREATE TABLE IF NOT EXISTS group_invites (
         group_id TEXT,
@@ -204,7 +310,6 @@ def init_database():
         FOREIGN KEY (group_id) REFERENCES chats (id) ON DELETE CASCADE,
         FOREIGN KEY (created_by) REFERENCES users (id) ON DELETE SET NULL
     )''')
-    
     conn.commit()
     conn.close()
     logger.info("✅ База данных инициализирована")
@@ -213,10 +318,7 @@ def get_user_by_login(login: str) -> Optional[Dict]:
     conn = sqlite3.connect(DATABASE)
     conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
-    cursor.execute(
-        "SELECT id, login, nickname, last_seen, is_online, hide_online, hide_last_seen FROM users WHERE login = ? AND deleted_at IS NULL", 
-        (login,)
-    )
+    cursor.execute("SELECT id, login, nickname, last_seen, is_online, hide_online, hide_last_seen FROM users WHERE login = ? AND deleted_at IS NULL", (login,))
     user = cursor.fetchone()
     conn.close()
     return dict(user) if user else None
@@ -225,10 +327,7 @@ def get_user_by_id(user_id: int) -> Optional[Dict]:
     conn = sqlite3.connect(DATABASE)
     conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
-    cursor.execute(
-        "SELECT id, login, nickname, last_seen, is_online, hide_online, hide_last_seen FROM users WHERE id = ? AND deleted_at IS NULL", 
-        (user_id,)
-    )
+    cursor.execute("SELECT id, login, nickname, last_seen, is_online, hide_online, hide_last_seen FROM users WHERE id = ? AND deleted_at IS NULL", (user_id,))
     user = cursor.fetchone()
     conn.close()
     return dict(user) if user else None
@@ -248,23 +347,18 @@ def search_users(query: str, current_user_id: int) -> list:
     ''', (f'%{query}%', f'%{query}%', current_user_id))
     users = cursor.fetchall()
     conn.close()
-    
     result = []
     for user in users:
         user_dict = dict(user)
         if user_dict['hide_online']:
             user_dict['is_online'] = False
         result.append(user_dict)
-    
     return result
 
 def create_user(login: str, nickname: str) -> int:
     conn = sqlite3.connect(DATABASE)
     cursor = conn.cursor()
-    cursor.execute(
-        "INSERT INTO users (login, nickname, last_seen, is_online) VALUES (?, ?, CURRENT_TIMESTAMP, 1)",
-        (login, nickname)
-    )
+    cursor.execute("INSERT INTO users (login, nickname, last_seen, is_online) VALUES (?, ?, CURRENT_TIMESTAMP, 1)", (login, nickname))
     user_id = cursor.lastrowid
     conn.commit()
     conn.close()
@@ -273,17 +367,12 @@ def create_user(login: str, nickname: str) -> int:
 def update_user_status(user_id: int, is_online: bool):
     conn = sqlite3.connect(DATABASE)
     cursor = conn.cursor()
-    cursor.execute(
-        "UPDATE users SET is_online = ?, last_seen = CURRENT_TIMESTAMP WHERE id = ? AND deleted_at IS NULL",
-        (1 if is_online else 0, user_id)
-    )
+    cursor.execute("UPDATE users SET is_online = ?, last_seen = CURRENT_TIMESTAMP WHERE id = ? AND deleted_at IS NULL", (1 if is_online else 0, user_id))
     conn.commit()
     conn.close()
 
 def update_user_privacy(user_id: int, hide_online: bool = None, hide_last_seen: bool = None):
-    updates = []
-    params = []
-    
+    updates, params = [], []
     if hide_online is not None:
         updates.append("hide_online = ?")
         params.append(1 if hide_online else 0)
@@ -291,7 +380,6 @@ def update_user_privacy(user_id: int, hide_online: bool = None, hide_last_seen: 
             hidden_online_users.add(user_id)
         elif user_id in hidden_online_users:
             hidden_online_users.remove(user_id)
-    
     if hide_last_seen is not None:
         updates.append("hide_last_seen = ?")
         params.append(1 if hide_last_seen else 0)
@@ -299,18 +387,12 @@ def update_user_privacy(user_id: int, hide_online: bool = None, hide_last_seen: 
             hidden_last_seen_users.add(user_id)
         elif user_id in hidden_last_seen_users:
             hidden_last_seen_users.remove(user_id)
-    
     if not updates:
         return True
-    
     params.append(user_id)
-    
     conn = sqlite3.connect(DATABASE)
     cursor = conn.cursor()
-    cursor.execute(
-        f"UPDATE users SET {', '.join(updates)} WHERE id = ? AND deleted_at IS NULL",
-        params
-    )
+    cursor.execute(f"UPDATE users SET {', '.join(updates)} WHERE id = ? AND deleted_at IS NULL", params)
     conn.commit()
     conn.close()
     return True
@@ -319,20 +401,10 @@ def delete_user_account(user_id: int) -> bool:
     try:
         conn = sqlite3.connect(DATABASE)
         cursor = conn.cursor()
-        
-        cursor.execute(
-            "UPDATE users SET deleted_at = CURRENT_TIMESTAMP, is_online = 0 WHERE id = ?",
-            (user_id,)
-        )
-        
-        cursor.execute(
-            "UPDATE chat_members SET left_at = CURRENT_TIMESTAMP WHERE user_id = ?",
-            (user_id,)
-        )
-        
+        cursor.execute("UPDATE users SET deleted_at = CURRENT_TIMESTAMP, is_online = 0 WHERE id = ?", (user_id,))
+        cursor.execute("UPDATE chat_members SET left_at = CURRENT_TIMESTAMP WHERE user_id = ?", (user_id,))
         conn.commit()
         conn.close()
-        
         if user_id in active_connections:
             del active_connections[user_id]
         if user_id in online_users:
@@ -343,7 +415,8 @@ def delete_user_account(user_id: int) -> bool:
             hidden_last_seen_users.remove(user_id)
         if user_id in premium_users:
             del premium_users[user_id]
-        
+        if user_id in friend_requests:
+            del friend_requests[user_id]
         logger.info(f"✅ Аккаунт пользователя {user_id} удален")
         return True
     except Exception as e:
@@ -354,11 +427,7 @@ def create_chat(chat_id: str, name: str, chat_type: str, owner_id: int, descript
     conn = sqlite3.connect(DATABASE)
     cursor = conn.cursor()
     try:
-        cursor.execute(
-            """INSERT INTO chats (id, name, type, owner_id, description, is_public, avatar_path) 
-               VALUES (?, ?, ?, ?, ?, ?, ?)""",
-            (chat_id, name, chat_type, owner_id, description, 1 if is_public else 0, f"GENERATE:{name}:#{random_color()}")
-        )
+        cursor.execute("INSERT INTO chats (id, name, type, owner_id, description, is_public, avatar_path) VALUES (?, ?, ?, ?, ?, ?, ?)", (chat_id, name, chat_type, owner_id, description, 1 if is_public else 0, f"GENERATE:{name}:#{random_color()}"))
         conn.commit()
         return True
     except Exception as e:
@@ -370,48 +439,30 @@ def create_chat(chat_id: str, name: str, chat_type: str, owner_id: int, descript
 def add_chat_member(chat_id: str, user_id: int, role: str = 'member'):
     conn = sqlite3.connect(DATABASE)
     cursor = conn.cursor()
-    cursor.execute(
-        "INSERT OR IGNORE INTO chat_members (chat_id, user_id, role) VALUES (?, ?, ?)",
-        (chat_id, user_id, role)
-    )
+    cursor.execute("INSERT OR IGNORE INTO chat_members (chat_id, user_id, role) VALUES (?, ?, ?)", (chat_id, user_id, role))
     conn.commit()
     conn.close()
 
 def add_channel_subscriber(channel_id: str, user_id: int):
     conn = sqlite3.connect(DATABASE)
     cursor = conn.cursor()
-    cursor.execute(
-        "INSERT OR IGNORE INTO channel_subscribers (channel_id, user_id) VALUES (?, ?)",
-        (channel_id, user_id)
-    )
-    cursor.execute(
-        "INSERT OR IGNORE INTO chat_members (chat_id, user_id, role) VALUES (?, ?, ?)",
-        (channel_id, user_id, 'subscriber')
-    )
+    cursor.execute("INSERT OR IGNORE INTO channel_subscribers (channel_id, user_id) VALUES (?, ?)", (channel_id, user_id))
+    cursor.execute("INSERT OR IGNORE INTO chat_members (chat_id, user_id, role) VALUES (?, ?, ?)", (channel_id, user_id, 'subscriber'))
     conn.commit()
     conn.close()
 
 def remove_channel_subscriber(channel_id: str, user_id: int):
     conn = sqlite3.connect(DATABASE)
     cursor = conn.cursor()
-    cursor.execute(
-        "UPDATE channel_subscribers SET unsubscribed_at = CURRENT_TIMESTAMP WHERE channel_id = ? AND user_id = ?",
-        (channel_id, user_id)
-    )
-    cursor.execute(
-        "UPDATE chat_members SET left_at = CURRENT_TIMESTAMP WHERE chat_id = ? AND user_id = ?",
-        (channel_id, user_id)
-    )
+    cursor.execute("UPDATE channel_subscribers SET unsubscribed_at = CURRENT_TIMESTAMP WHERE channel_id = ? AND user_id = ?", (channel_id, user_id))
+    cursor.execute("UPDATE chat_members SET left_at = CURRENT_TIMESTAMP WHERE chat_id = ? AND user_id = ?", (channel_id, user_id))
     conn.commit()
     conn.close()
 
 def is_chat_member(chat_id: str, user_id: int) -> bool:
     conn = sqlite3.connect(DATABASE)
     cursor = conn.cursor()
-    cursor.execute(
-        "SELECT 1 FROM chat_members WHERE chat_id = ? AND user_id = ? AND left_at IS NULL",
-        (chat_id, user_id)
-    )
+    cursor.execute("SELECT 1 FROM chat_members WHERE chat_id = ? AND user_id = ? AND left_at IS NULL", (chat_id, user_id))
     result = cursor.fetchone() is not None
     conn.close()
     return result
@@ -440,11 +491,9 @@ def get_user_chats(user_id: int) -> list:
     ''', (user_id,))
     chats = cursor.fetchall()
     conn.close()
-    
     result = []
     for chat in chats:
         chat_dict = dict(chat)
-        # Форматируем время последнего сообщения
         if chat_dict.get('last_message_time'):
             try:
                 time_obj = datetime.fromisoformat(chat_dict['last_message_time'].replace('Z', '+00:00'))
@@ -454,16 +503,12 @@ def get_user_chats(user_id: int) -> list:
         else:
             chat_dict['time'] = ''
         result.append(chat_dict)
-    
     return result
 
 def get_chat_members(chat_id: str) -> list:
     conn = sqlite3.connect(DATABASE)
     cursor = conn.cursor()
-    cursor.execute(
-        "SELECT user_id FROM chat_members WHERE chat_id = ? AND left_at IS NULL",
-        (chat_id,)
-    )
+    cursor.execute("SELECT user_id FROM chat_members WHERE chat_id = ? AND left_at IS NULL", (chat_id,))
     members = cursor.fetchall()
     conn.close()
     return [member[0] for member in members]
@@ -472,13 +517,8 @@ def get_chat_info(chat_id: str, user_id: int) -> Optional[Dict]:
     conn = sqlite3.connect(DATABASE)
     conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
-    
-    cursor.execute(
-        "SELECT role FROM chat_members WHERE chat_id = ? AND user_id = ? AND left_at IS NULL",
-        (chat_id, user_id)
-    )
+    cursor.execute("SELECT role FROM chat_members WHERE chat_id = ? AND user_id = ? AND left_at IS NULL", (chat_id, user_id))
     membership = cursor.fetchone()
-    
     cursor.execute('''
         SELECT c.*, u.nickname as owner_nickname,
                (SELECT COUNT(*) FROM chat_members WHERE chat_id = c.id AND left_at IS NULL) as members_count
@@ -487,22 +527,15 @@ def get_chat_info(chat_id: str, user_id: int) -> Optional[Dict]:
         WHERE c.id = ? AND c.deleted_at IS NULL
     ''', (chat_id,))
     chat = cursor.fetchone()
-    
     if not chat:
         conn.close()
         return None
-    
     result = dict(chat)
     result['is_member'] = membership is not None
     result['user_role'] = membership['role'] if membership else None
-    
     if result['type'] == 'channel':
-        cursor.execute(
-            "SELECT COUNT(*) FROM channel_subscribers WHERE channel_id = ? AND unsubscribed_at IS NULL",
-            (chat_id,)
-        )
+        cursor.execute("SELECT COUNT(*) FROM channel_subscribers WHERE channel_id = ? AND unsubscribed_at IS NULL", (chat_id,))
         result['subscribers_count'] = cursor.fetchone()[0]
-    
     conn.close()
     return result
 
@@ -511,12 +544,7 @@ def generate_invite_code(group_id: str, created_by: int, expires_in_days: int = 
     cursor = conn.cursor()
     invite_code = ''.join(random.choices(string.ascii_uppercase + string.digits, k=8))
     expires_at = (datetime.now() + timedelta(days=expires_in_days)).isoformat()
-    
-    cursor.execute(
-        """INSERT INTO group_invites (group_id, invite_code, created_by, expires_at, uses_left) 
-           VALUES (?, ?, ?, ?, ?)""",
-        (group_id, invite_code, created_by, expires_at, uses)
-    )
+    cursor.execute("INSERT INTO group_invites (group_id, invite_code, created_by, expires_at, uses_left) VALUES (?, ?, ?, ?, ?)", (group_id, invite_code, created_by, expires_at, uses))
     conn.commit()
     conn.close()
     return invite_code
@@ -524,69 +552,23 @@ def generate_invite_code(group_id: str, created_by: int, expires_in_days: int = 
 def use_invite_code(invite_code: str, user_id: int) -> Optional[str]:
     conn = sqlite3.connect(DATABASE)
     cursor = conn.cursor()
-    
-    cursor.execute(
-        "SELECT group_id, expires_at, uses_left FROM group_invites WHERE invite_code = ?",
-        (invite_code,)
-    )
+    cursor.execute("SELECT group_id, expires_at, uses_left FROM group_invites WHERE invite_code = ?", (invite_code,))
     invite = cursor.fetchone()
-    
     if not invite:
         conn.close()
         return None
-    
     group_id, expires_at, uses_left = invite
-    
     if datetime.fromisoformat(expires_at) < datetime.now():
         conn.close()
         return None
-    
     if uses_left <= 0:
         conn.close()
         return None
-    
-    cursor.execute(
-        "INSERT OR IGNORE INTO chat_members (chat_id, user_id, role) VALUES (?, ?, ?)",
-        (group_id, user_id, 'member')
-    )
-    
-    cursor.execute(
-        "UPDATE group_invites SET uses_left = uses_left - 1 WHERE invite_code = ?",
-        (invite_code,)
-    )
-    
+    cursor.execute("INSERT OR IGNORE INTO chat_members (chat_id, user_id, role) VALUES (?, ?, ?)", (group_id, user_id, 'member'))
+    cursor.execute("UPDATE group_invites SET uses_left = uses_left - 1 WHERE invite_code = ?", (invite_code,))
     conn.commit()
     conn.close()
     return group_id
-
-def random_color() -> str:
-    colors = ['2196F3', '4CAF50', 'F44336', '9C27B0', 'FF9800', '795548', '607D8B']
-    return random.choice(colors)
-
-def format_last_seen(timestamp: str, hide_last_seen: bool = False) -> str:
-    if hide_last_seen:
-        return "скрыто"
-    
-    if not timestamp:
-        return "никогда"
-    
-    try:
-        last = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
-        now = datetime.now()
-        delta = now - last
-        
-        if delta.days > 7:
-            return last.strftime('%d.%m.%Y')
-        elif delta.days > 0:
-            return f"{delta.days} дн. назад"
-        elif delta.seconds > 3600:
-            return f"{delta.seconds // 3600} ч. назад"
-        elif delta.seconds > 60:
-            return f"{delta.seconds // 60} мин. назад"
-        else:
-            return "только что"
-    except:
-        return "неизвестно"
 
 async def notify_contacts_status_change(user_id: int, is_online: bool):
     conn = sqlite3.connect(DATABASE)
@@ -599,7 +581,6 @@ async def notify_contacts_status_change(user_id: int, is_online: bool):
     ''', (user_id, user_id))
     contacts = cursor.fetchall()
     conn.close()
-    
     for (contact_id,) in contacts:
         if contact_id in active_connections:
             try:
@@ -613,22 +594,16 @@ async def notify_contacts_status_change(user_id: int, is_online: bool):
 
 async def handle_http_request(path, request_headers):
     if path == "/" or path == "/health":
-        headers = [
-            ("Content-Type", "text/plain"),
-            ("Content-Length", "2"),
-            ("Connection", "close")
-        ]
+        headers = [("Content-Type", "text/plain"), ("Content-Length", "2"), ("Connection", "close")]
         return (200, headers, b"OK")
     return None
 
 async def ws_handler(websocket):
     client_ip = websocket.remote_address[0]
-    
     if is_banned(client_ip):
         logger.warning(f"🚫 Заблокирован запрос от забаненного IP: {client_ip}")
         await websocket.close()
         return
-    
     session_id = str(uuid.uuid4())[:8]
     logger.info(f"🔌 Новое подключение (сессия: {session_id}, IP: {client_ip})")
     user_id = None
@@ -640,7 +615,6 @@ async def ws_handler(websocket):
                 await websocket.send(json.dumps({"error": "Слишком много запросов"}))
                 await websocket.close()
                 return
-            
             try:
                 data = json.loads(message)
                 command = data.get("cmd")
@@ -651,7 +625,9 @@ async def ws_handler(websocket):
                     "GET_USER_INFO", "CREATE_CHAT", "PING", "SEARCH_USERS",
                     "CREATE_GROUP", "CREATE_CHANNEL", "JOIN_CHANNEL", "LEAVE_CHANNEL",
                     "GET_INVITE_LINK", "JOIN_WITH_INVITE", "ACTIVATE_PREMIUM",
-                    "CHECK_PREMIUM", "GET_PREMIUM_INFO"
+                    "CHECK_PREMIUM", "GET_PREMIUM_INFO",
+                    "SEND_FRIEND_REQUEST", "GET_FRIEND_REQUESTS", 
+                    "ACCEPT_FRIEND_REQUEST", "REJECT_FRIEND_REQUEST"
                 ]
 
                 if requires_auth and user_id is None:
@@ -664,21 +640,16 @@ async def ws_handler(websocket):
                     if not login:
                         await websocket.send(json.dumps({"error": "Логин не указан"}))
                         continue
-
                     existing = get_user_by_login(login)
                     if existing:
                         await websocket.send(json.dumps({"error": "Пользователь существует"}))
                         continue
-
                     user_id = create_user(login, login)
-                    
                     anonimgram_chat_id = f"system_{user_id}"
                     create_chat(anonimgram_chat_id, "AnonimGram", "system", user_id)
                     add_chat_member(anonimgram_chat_id, user_id, 'member')
-
                     active_connections[user_id] = websocket
                     online_users.add(user_id)
-
                     await websocket.send(json.dumps({
                         "status": "REGISTERED",
                         "user_id": user_id,
@@ -689,9 +660,7 @@ async def ws_handler(websocket):
                 # --- ВХОД ---
                 elif command == "LOGIN":
                     login = data.get("login")
-                    
                     user = get_user_by_login(login)
-                    
                     if not user:
                         user_id = create_user(login, login)
                         anonimgram_chat_id = f"system_{user_id}"
@@ -700,23 +669,18 @@ async def ws_handler(websocket):
                         logger.info(f"✅ Автоматическая регистрация: ID {user_id}")
                     else:
                         user_id = user["id"]
-
                     if user_id in active_connections:
                         try:
                             await active_connections[user_id].close()
                         except:
                             pass
-
                     active_connections[user_id] = websocket
                     online_users.add(user_id)
                     update_user_status(user_id, True)
-
                     user = get_user_by_id(user_id)
-                    
                     user_info = dict(user)
                     user_info['is_premium'] = is_premium(user_id)
                     user_info['premium_plan'] = premium_users.get(user_id, {}).get('plan') if is_premium(user_id) else None
-
                     await websocket.send(json.dumps({
                         "status": "LOGGED_IN",
                         "user_id": user_id,
@@ -729,16 +693,13 @@ async def ws_handler(websocket):
                     if user_id is None:
                         await websocket.send(json.dumps({"error": "Не авторизован"}))
                         continue
-                    
                     hide_online = data.get("hide_online")
                     hide_last_seen = data.get("hide_last_seen")
-                    
                     if update_user_privacy(user_id, hide_online, hide_last_seen):
                         await websocket.send(json.dumps({
                             "status": "PRIVACY_UPDATED",
                             "message": "Настройки приватности обновлены"
                         }))
-                        
                         if hide_online is not None:
                             if hide_online:
                                 await notify_contacts_status_change(user_id, False)
@@ -753,7 +714,6 @@ async def ws_handler(websocket):
                     if user_id is None:
                         await websocket.send(json.dumps({"error": "Не авторизован"}))
                         continue
-                    
                     confirm = data.get("confirm", False)
                     if not confirm:
                         await websocket.send(json.dumps({
@@ -761,15 +721,12 @@ async def ws_handler(websocket):
                             "need_confirm": True
                         }))
                         continue
-                    
                     await notify_contacts_status_change(user_id, False)
-                    
                     if delete_user_account(user_id):
                         await websocket.send(json.dumps({
                             "status": "ACCOUNT_DELETED",
                             "message": "Аккаунт успешно удален"
                         }))
-                        
                         await websocket.close()
                     else:
                         await websocket.send(json.dumps({"error": "Ошибка удаления аккаунта"}))
@@ -777,17 +734,14 @@ async def ws_handler(websocket):
                 # --- АКТИВАЦИЯ PREMIUM ---
                 elif command == "ACTIVATE_PREMIUM":
                     plan = data.get("plan")
-                    
                     if user_id is None:
                         await websocket.send(json.dumps({"error": "Не авторизован"}))
                         continue
-                    
                     if plan == "1day" and has_used_free_trial(user_id):
                         await websocket.send(json.dumps({
                             "error": "Бесплатный день уже использован"
                         }))
                         continue
-                    
                     if activate_premium(user_id, plan):
                         await websocket.send(json.dumps({
                             "status": "PREMIUM_ACTIVATED",
@@ -803,7 +757,6 @@ async def ws_handler(websocket):
                     if user_id is None:
                         await websocket.send(json.dumps({"error": "Не авторизован"}))
                         continue
-                    
                     await websocket.send(json.dumps({
                         "cmd": "PREMIUM_STATUS",
                         "is_premium": is_premium(user_id),
@@ -811,14 +764,78 @@ async def ws_handler(websocket):
                         "expiry": premium_users.get(user_id, {}).get('expiry') if is_premium(user_id) else None
                     }))
 
+                # --- ЗАПРОСЫ НА ДРУЖБУ ---
+                elif command == "SEND_FRIEND_REQUEST":
+                    target_user_id = data.get("target_user_id")
+                    if not target_user_id:
+                        await websocket.send(json.dumps({"error": "ID пользователя не указан"}))
+                        continue
+                    if user_id is None:
+                        await websocket.send(json.dumps({"error": "Не авторизован"}))
+                        continue
+                    target_user_id = int(target_user_id)
+                    target = get_user_by_id(target_user_id)
+                    if not target:
+                        await websocket.send(json.dumps({"error": "Пользователь не найден"}))
+                        continue
+                    if send_friend_request(user_id, target_user_id):
+                        await websocket.send(json.dumps({
+                            "status": "FRIEND_REQUEST_SENT",
+                            "target_user_id": target_user_id,
+                            "message": "Запрос отправлен"
+                        }))
+                    else:
+                        await websocket.send(json.dumps({"error": "Запрос уже отправлен"}))
+
+                elif command == "GET_FRIEND_REQUESTS":
+                    if user_id is None:
+                        await websocket.send(json.dumps({"error": "Не авторизован"}))
+                        continue
+                    requests = get_friend_requests(user_id)
+                    await websocket.send(json.dumps({
+                        "cmd": "FRIEND_REQUESTS_LIST",
+                        "requests": requests
+                    }))
+
+                elif command == "ACCEPT_FRIEND_REQUEST":
+                    from_user_id = data.get("from_user_id")
+                    if not from_user_id:
+                        await websocket.send(json.dumps({"error": "ID отправителя не указан"}))
+                        continue
+                    if user_id is None:
+                        await websocket.send(json.dumps({"error": "Не авторизован"}))
+                        continue
+                    from_user_id = int(from_user_id)
+                    if accept_friend_request(user_id, from_user_id):
+                        await websocket.send(json.dumps({
+                            "status": "FRIEND_REQUEST_ACCEPTED",
+                            "chat_id": generate_private_chat_id(user_id, from_user_id)
+                        }))
+                    else:
+                        await websocket.send(json.dumps({"error": "Запрос не найден"}))
+
+                elif command == "REJECT_FRIEND_REQUEST":
+                    from_user_id = data.get("from_user_id")
+                    if not from_user_id:
+                        await websocket.send(json.dumps({"error": "ID отправителя не указан"}))
+                        continue
+                    if user_id is None:
+                        await websocket.send(json.dumps({"error": "Не авторизован"}))
+                        continue
+                    from_user_id = int(from_user_id)
+                    if reject_friend_request(user_id, from_user_id):
+                        await websocket.send(json.dumps({
+                            "status": "FRIEND_REQUEST_REJECTED"
+                        }))
+                    else:
+                        await websocket.send(json.dumps({"error": "Запрос не найден"}))
+
                 # --- ПОЛУЧЕНИЕ СПИСКА ЧАТОВ ---
                 elif command == "GET_CHATS":
                     if user_id is None:
                         await websocket.send(json.dumps({"error": "Не авторизован"}))
                         continue
-
                     chats = get_user_chats(user_id)
-                    
                     for chat in chats:
                         if chat["type"] == "private":
                             if chat["id"].startswith("private_"):
@@ -828,11 +845,7 @@ async def ws_handler(websocket):
                                     other = get_user_by_id(other_id)
                                     if other:
                                         is_online = other["is_online"] and other_id not in hidden_online_users
-                                        last_seen = format_last_seen(
-                                            other["last_seen"], 
-                                            other_id in hidden_last_seen_users
-                                        )
-                                        
+                                        last_seen = format_last_seen(other["last_seen"], other_id in hidden_last_seen_users)
                                         chat["other_user"] = {
                                             "id": other["id"],
                                             "nickname": other["nickname"],
@@ -840,12 +853,10 @@ async def ws_handler(websocket):
                                             "last_seen": last_seen
                                         }
                                         chat["name"] = other["nickname"]
-                        
                         elif chat["type"] == "group" or chat["type"] == "channel":
                             owner = get_user_by_id(chat.get("owner_id"))
                             if owner:
                                 chat["owner_nickname"] = owner["nickname"]
-
                     await websocket.send(json.dumps({
                         "cmd": "CHATS_LIST",
                         "chats": chats
@@ -854,17 +865,13 @@ async def ws_handler(websocket):
                 # --- ПОЛУЧЕНИЕ СООБЩЕНИЙ ---
                 elif command == "GET_MESSAGES":
                     chat_id = data.get("chat_id")
-                    
                     if user_id is None:
                         await websocket.send(json.dumps({"error": "Не авторизован"}))
                         continue
-
                     if not is_chat_member(chat_id, user_id):
                         await websocket.send(json.dumps({"error": "Нет доступа к чату"}))
                         continue
-
                     messages = []
-                    
                     if chat_id.startswith("system_"):
                         messages.append({
                             "id": f"msg_{uuid.uuid4().hex[:16]}",
@@ -873,7 +880,6 @@ async def ws_handler(websocket):
                             "sender_id": 0,
                             "is_system": True
                         })
-
                     await websocket.send(json.dumps({
                         "cmd": "MESSAGES",
                         "messages": messages,
@@ -884,43 +890,31 @@ async def ws_handler(websocket):
                 elif command == "SEND_MESSAGE":
                     chat_id = data.get("chat_id")
                     text = data.get("text")
-                    
                     if not chat_id or not text:
                         await websocket.send(json.dumps({"error": "Недостаточно данных"}))
                         continue
-
                     if user_id is None:
                         await websocket.send(json.dumps({"error": "Не авторизован"}))
                         continue
-
                     if not is_chat_member(chat_id, user_id):
                         await websocket.send(json.dumps({"error": "Нет доступа к чату"}))
                         continue
-
                     conn = sqlite3.connect(DATABASE)
                     cursor = conn.cursor()
                     cursor.execute("SELECT type FROM chats WHERE id = ?", (chat_id,))
                     chat_type = cursor.fetchone()
                     conn.close()
-                    
                     chat_type = chat_type[0] if chat_type else None
-                    
                     if chat_type == 'channel':
                         cursor = conn.cursor()
-                        cursor.execute(
-                            "SELECT role FROM chat_members WHERE chat_id = ? AND user_id = ?",
-                            (chat_id, user_id)
-                        )
+                        cursor.execute("SELECT role FROM chat_members WHERE chat_id = ? AND user_id = ?", (chat_id, user_id))
                         role = cursor.fetchone()
                         if not role or role[0] not in ('owner', 'admin'):
                             await websocket.send(json.dumps({"error": "Только владелец и админы могут писать в канал"}))
                             continue
-
                     members = get_chat_members(chat_id)
-
                     message_id = f"msg_{uuid.uuid4().hex[:16]}"
                     sent_time = datetime.now().strftime('%H:%M')
-
                     for member_id in members:
                         if member_id in active_connections:
                             try:
@@ -941,21 +935,14 @@ async def ws_handler(websocket):
                 # --- ПОИСК ПОЛЬЗОВАТЕЛЕЙ ---
                 elif command == "SEARCH_USERS":
                     query = data.get("query", "")
-                    
                     if user_id is None:
                         await websocket.send(json.dumps({"error": "Не авторизован"}))
                         continue
-
                     users = search_users(query, user_id)
-                    
                     for user in users:
                         user_id_to_check = user["id"]
                         user["is_online"] = user["is_online"] and user_id_to_check not in hidden_online_users
-                        user["last_seen_display"] = format_last_seen(
-                            user["last_seen"],
-                            user_id_to_check in hidden_last_seen_users
-                        )
-
+                        user["last_seen_display"] = format_last_seen(user["last_seen"], user_id_to_check in hidden_last_seen_users)
                     await websocket.send(json.dumps({
                         "cmd": "SEARCH_RESULTS",
                         "users": users
@@ -964,28 +951,19 @@ async def ws_handler(websocket):
                 # --- ПОЛУЧЕНИЕ ИНФОРМАЦИИ О ПОЛЬЗОВАТЕЛЕ ---
                 elif command == "GET_USER_INFO":
                     target_id = data.get("user_id")
-                    
                     if not target_id:
                         await websocket.send(json.dumps({"error": "ID не указан"}))
                         continue
-
                     if user_id is None:
                         await websocket.send(json.dumps({"error": "Не авторизован"}))
                         continue
-
                     target_id = int(target_id)
                     user = get_user_by_id(target_id)
-                    
                     if user:
                         user["is_online"] = user["is_online"] and target_id not in hidden_online_users
-                        user["last_seen_display"] = format_last_seen(
-                            user["last_seen"],
-                            target_id in hidden_last_seen_users
-                        )
-                        
+                        user["last_seen_display"] = format_last_seen(user["last_seen"], target_id in hidden_last_seen_users)
                         chat_id = generate_private_chat_id(user_id, target_id)
                         user["existing_chat_id"] = chat_id if is_chat_member(chat_id, user_id) else None
-                        
                         await websocket.send(json.dumps({
                             "cmd": "USER_INFO",
                             "user_info": user
@@ -996,30 +974,22 @@ async def ws_handler(websocket):
                 # --- СОЗДАНИЕ ПРИВАТНОГО ЧАТА ---
                 elif command == "CREATE_PRIVATE_CHAT":
                     target_user_id = data.get("target_user_id")
-                    
                     if not target_user_id:
                         await websocket.send(json.dumps({"error": "ID пользователя не указан"}))
                         continue
-
                     if user_id is None:
                         await websocket.send(json.dumps({"error": "Не авторизован"}))
                         continue
-
                     target_user_id = int(target_user_id)
-                    
                     target = get_user_by_id(target_user_id)
                     if not target:
                         await websocket.send(json.dumps({"error": "Пользователь не найден"}))
                         continue
-
                     chat_id = generate_private_chat_id(user_id, target_user_id)
-                    
                     target_name = target.get("nickname", f"User {target_user_id}")
                     create_chat(chat_id, target_name, "private", user_id)
-                    
                     add_chat_member(chat_id, user_id, 'member')
                     add_chat_member(chat_id, target_user_id, 'member')
-
                     if target_user_id in active_connections:
                         current_user = get_user_by_id(user_id)
                         await active_connections[target_user_id].send(json.dumps({
@@ -1030,7 +1000,6 @@ async def ws_handler(websocket):
                                 "type": "private"
                             }
                         }))
-
                     await websocket.send(json.dumps({
                         "status": "CHAT_CREATED",
                         "chat_id": chat_id
@@ -1040,22 +1009,16 @@ async def ws_handler(websocket):
                 elif command == "CREATE_GROUP":
                     name = data.get("name")
                     description = data.get("description", "")
-                    
                     if not name:
                         await websocket.send(json.dumps({"error": "Название группы не указано"}))
                         continue
-
                     if user_id is None:
                         await websocket.send(json.dumps({"error": "Не авторизован"}))
                         continue
-
                     chat_id = generate_group_id()
                     create_chat(chat_id, name, "group", user_id, description, is_public=False)
-                    
                     add_chat_member(chat_id, user_id, 'owner')
-
                     invite_code = generate_invite_code(chat_id, user_id)
-
                     await websocket.send(json.dumps({
                         "status": "GROUP_CREATED",
                         "chat_id": chat_id,
@@ -1067,20 +1030,15 @@ async def ws_handler(websocket):
                     name = data.get("name")
                     description = data.get("description", "")
                     is_public = data.get("is_public", False)
-                    
                     if not name:
                         await websocket.send(json.dumps({"error": "Название канала не указано"}))
                         continue
-
                     if user_id is None:
                         await websocket.send(json.dumps({"error": "Не авторизован"}))
                         continue
-
                     chat_id = generate_channel_id()
                     create_chat(chat_id, name, "channel", user_id, description, is_public)
-                    
                     add_chat_member(chat_id, user_id, 'owner')
-
                     await websocket.send(json.dumps({
                         "status": "CHANNEL_CREATED",
                         "chat_id": chat_id
@@ -1089,17 +1047,13 @@ async def ws_handler(websocket):
                 # --- ПОЛУЧЕНИЕ ИНФОРМАЦИИ О ЧАТЕ ---
                 elif command == "GET_CHAT_INFO":
                     chat_id = data.get("chat_id")
-                    
                     if not chat_id:
                         await websocket.send(json.dumps({"error": "ID чата не указан"}))
                         continue
-
                     if user_id is None:
                         await websocket.send(json.dumps({"error": "Не авторизован"}))
                         continue
-
                     chat_info = get_chat_info(chat_id, user_id)
-                    
                     if chat_info:
                         await websocket.send(json.dumps({
                             "cmd": "CHAT_INFO",
@@ -1111,40 +1065,29 @@ async def ws_handler(websocket):
                 # --- ВСТУПЛЕНИЕ В КАНАЛ ---
                 elif command == "JOIN_CHANNEL":
                     channel_id = data.get("channel_id")
-                    
                     if not channel_id:
                         await websocket.send(json.dumps({"error": "ID канала не указан"}))
                         continue
-
                     if user_id is None:
                         await websocket.send(json.dumps({"error": "Не авторизован"}))
                         continue
-
                     conn = sqlite3.connect(DATABASE)
                     cursor = conn.cursor()
-                    cursor.execute(
-                        "SELECT type, is_public FROM chats WHERE id = ? AND deleted_at IS NULL",
-                        (channel_id,)
-                    )
+                    cursor.execute("SELECT type, is_public FROM chats WHERE id = ? AND deleted_at IS NULL", (channel_id,))
                     chat = cursor.fetchone()
                     conn.close()
-                    
                     if not chat or chat[0] != 'channel':
                         await websocket.send(json.dumps({"error": "Канал не найден"}))
                         continue
-                    
                     if is_chat_member(channel_id, user_id):
                         await websocket.send(json.dumps({"error": "Вы уже в канале"}))
                         continue
-                    
                     add_channel_subscriber(channel_id, user_id)
-                    
                     conn = sqlite3.connect(DATABASE)
                     cursor = conn.cursor()
                     cursor.execute("SELECT owner_id FROM chats WHERE id = ?", (channel_id,))
                     owner_id = cursor.fetchone()
                     conn.close()
-                    
                     if owner_id and owner_id[0] in active_connections:
                         try:
                             await active_connections[owner_id[0]].send(json.dumps({
@@ -1154,7 +1097,6 @@ async def ws_handler(websocket):
                             }))
                         except:
                             pass
-                    
                     await websocket.send(json.dumps({
                         "status": "JOINED_CHANNEL",
                         "message": "Вы успешно подписались на канал"
@@ -1163,30 +1105,21 @@ async def ws_handler(websocket):
                 # --- ВЫХОД ИЗ КАНАЛА ---
                 elif command == "LEAVE_CHANNEL":
                     channel_id = data.get("channel_id")
-                    
                     if not channel_id:
                         await websocket.send(json.dumps({"error": "ID канала не указан"}))
                         continue
-
                     if user_id is None:
                         await websocket.send(json.dumps({"error": "Не авторизован"}))
                         continue
-
                     conn = sqlite3.connect(DATABASE)
                     cursor = conn.cursor()
-                    cursor.execute(
-                        "SELECT owner_id FROM chats WHERE id = ?",
-                        (channel_id,)
-                    )
+                    cursor.execute("SELECT owner_id FROM chats WHERE id = ?", (channel_id,))
                     owner = cursor.fetchone()
                     conn.close()
-                    
                     if owner and owner[0] == user_id:
                         await websocket.send(json.dumps({"error": "Владелец не может покинуть канал"}))
                         continue
-                    
                     remove_channel_subscriber(channel_id, user_id)
-                    
                     await websocket.send(json.dumps({
                         "status": "LEFT_CHANNEL",
                         "message": "Вы отписались от канала"
@@ -1195,30 +1128,21 @@ async def ws_handler(websocket):
                 # --- ПОЛУЧЕНИЕ КОДА ПРИГЛАШЕНИЯ ---
                 elif command == "GET_INVITE_LINK":
                     chat_id = data.get("chat_id")
-                    
                     if not chat_id:
                         await websocket.send(json.dumps({"error": "ID чата не указан"}))
                         continue
-
                     if user_id is None:
                         await websocket.send(json.dumps({"error": "Не авторизован"}))
                         continue
-
                     conn = sqlite3.connect(DATABASE)
                     cursor = conn.cursor()
-                    cursor.execute(
-                        "SELECT role FROM chat_members WHERE chat_id = ? AND user_id = ?",
-                        (chat_id, user_id)
-                    )
+                    cursor.execute("SELECT role FROM chat_members WHERE chat_id = ? AND user_id = ?", (chat_id, user_id))
                     role = cursor.fetchone()
                     conn.close()
-                    
                     if not role or role[0] not in ('owner', 'admin'):
                         await websocket.send(json.dumps({"error": "Недостаточно прав"}))
                         continue
-                    
                     invite_code = generate_invite_code(chat_id, user_id)
-                    
                     await websocket.send(json.dumps({
                         "cmd": "INVITE_LINK",
                         "invite_code": invite_code,
@@ -1228,17 +1152,13 @@ async def ws_handler(websocket):
                 # --- ВСТУПЛЕНИЕ ПО ПРИГЛАШЕНИЮ ---
                 elif command == "JOIN_WITH_INVITE":
                     invite_code = data.get("invite_code")
-                    
                     if not invite_code:
                         await websocket.send(json.dumps({"error": "Код приглашения не указан"}))
                         continue
-
                     if user_id is None:
                         await websocket.send(json.dumps({"error": "Не авторизован"}))
                         continue
-
                     group_id = use_invite_code(invite_code, user_id)
-                    
                     if group_id:
                         members = get_chat_members(group_id)
                         for member_id in members:
@@ -1251,7 +1171,6 @@ async def ws_handler(websocket):
                                     }))
                                 except:
                                     pass
-                        
                         await websocket.send(json.dumps({
                             "status": "JOINED_GROUP",
                             "chat_id": group_id
@@ -1263,12 +1182,9 @@ async def ws_handler(websocket):
                 elif command == "TYPING":
                     chat_id = data.get("chat_id")
                     is_typing = data.get("is_typing", True)
-                    
                     if not chat_id or user_id is None:
                         continue
-
                     members = get_chat_members(chat_id)
-
                     for member_id in members:
                         if member_id != user_id and member_id in active_connections:
                             try:
@@ -1312,18 +1228,15 @@ async def ws_handler(websocket):
             if user_id in online_users:
                 online_users.remove(user_id)
             update_user_status(user_id, False)
-            
             if user_id not in hidden_online_users:
                 await notify_contacts_status_change(user_id, False)
-            
             logger.info(f"👋 Пользователь {user_id} отключился")
 
 async def main():
     try:
         init_database()
-        
         asyncio.create_task(check_expired_premium())
-        
+        asyncio.create_task(auto_ping())
         async with websockets.serve(
             ws_handler,
             HOST,
@@ -1335,10 +1248,11 @@ async def main():
             logger.info(f"✅ Анонимный сервер AnonimGram запущен на ws://{HOST}:{PORT}")
             logger.info(f"📊 База данных: {DATABASE}")
             logger.info(f"⭐ Premium поддержка: включена")
+            logger.info(f"📨 Система запросов на дружбу: включена")
+            logger.info(f"🔄 Auto-ping: каждую минуту")
             logger.info(f"🛡️ Защита от DDoS: включена")
             logger.info("⏳ Сервер готов...")
             await asyncio.Future()
-
     except Exception as e:
         logger.error(f"❌ Ошибка запуска: {e}")
         raise
