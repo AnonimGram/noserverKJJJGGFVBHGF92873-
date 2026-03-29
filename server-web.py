@@ -627,7 +627,7 @@ async def ws_handler(websocket):
                     "GET_INVITE_LINK", "JOIN_WITH_INVITE", "ACTIVATE_PREMIUM",
                     "CHECK_PREMIUM", "GET_PREMIUM_INFO",
                     "SEND_FRIEND_REQUEST", "GET_FRIEND_REQUESTS", 
-                    "ACCEPT_FRIEND_REQUEST", "REJECT_FRIEND_REQUEST"
+                    "ACCEPT_FRIEND_REQUEST", "REJECT_FRIEND_REQUEST", "JOIN_PRIVATE_CHAT"
                 ]
 
                 if requires_auth and user_id is None:
@@ -830,6 +830,49 @@ async def ws_handler(websocket):
                     else:
                         await websocket.send(json.dumps({"error": "Запрос не найден"}))
 
+                # --- ВСТУПЛЕНИЕ В ПРИВАТНЫЙ ЧАТ (ДОБАВЛЕНО) ---
+                elif command == "JOIN_PRIVATE_CHAT":
+                    chat_id = data.get("chat_id")
+                    if not chat_id:
+                        await websocket.send(json.dumps({"error": "ID чата не указан"}))
+                        continue
+                    if user_id is None:
+                        await websocket.send(json.dumps({"error": "Не авторизован"}))
+                        continue
+                    
+                    conn = sqlite3.connect(DATABASE)
+                    cursor = conn.cursor()
+                    
+                    # Проверяем, существует ли чат
+                    cursor.execute("SELECT id FROM chats WHERE id = ? AND deleted_at IS NULL", (chat_id,))
+                    chat = cursor.fetchone()
+                    
+                    if not chat:
+                        # Если чата нет, создаём его
+                        if chat_id.startswith("private_"):
+                            parts = chat_id.split('_')
+                            if len(parts) == 3:
+                                other_id = int(parts[2]) if int(parts[2]) != user_id else int(parts[1])
+                                other_user = get_user_by_id(other_id)
+                                if other_user:
+                                    chat_name = other_user.get("nickname", f"User {other_id}")
+                                    create_chat(chat_id, chat_name, "private", user_id)
+                                    logger.info(f"✅ Создан приватный чат {chat_id} при вступлении")
+                    
+                    # Добавляем пользователя в чат, если его там нет
+                    cursor.execute("SELECT 1 FROM chat_members WHERE chat_id = ? AND user_id = ? AND left_at IS NULL", (chat_id, user_id))
+                    if not cursor.fetchone():
+                        add_chat_member(chat_id, user_id, 'member')
+                        logger.info(f"✅ Пользователь {user_id} добавлен в чат {chat_id}")
+                    
+                    conn.close()
+                    
+                    await websocket.send(json.dumps({
+                        "status": "JOINED_PRIVATE_CHAT",
+                        "chat_id": chat_id,
+                        "message": "Вы успешно вступили в чат"
+                    }))
+
                 # --- ПОЛУЧЕНИЕ СПИСКА ЧАТОВ ---
                 elif command == "GET_CHATS":
                     if user_id is None:
@@ -875,7 +918,7 @@ async def ws_handler(websocket):
                     if chat_id.startswith("system_"):
                         messages.append({
                             "id": f"msg_{uuid.uuid4().hex[:16]}",
-                            "text": "🔐 Анонимный чат. Сообщения не сохраняются.",
+                            "text": "🔐 Анонимный чат. Сообщения не сохраняются на сервере.",
                             "time": datetime.now().strftime('%H:%M'),
                             "sender_id": 0,
                             "is_system": True
