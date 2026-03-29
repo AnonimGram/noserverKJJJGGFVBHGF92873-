@@ -243,7 +243,7 @@ async def auto_ping():
         try:
             import aiohttp
             async with aiohttp.ClientSession() as session:
-                async with session.get(f'http://{HOST}:{PORT}/') as resp:
+                async with session.get(f'http://server-web-crow.onrender.com/') as resp:
                     logger.info(f"🔄 Auto-ping: статус {resp.status}")
         except Exception as e:
             logger.warning(f"⚠️ Auto-ping ошибка: {e}")
