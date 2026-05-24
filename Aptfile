@@ -1,0 +1,5 @@
+pkg-config
+libopus-dev
+libvpx-dev
+libx264-dev
+libssl-dev
